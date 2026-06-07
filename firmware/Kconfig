@@ -1,0 +1,25 @@
+source "Kconfig.zephyr"
+
+menu "Application MQTT/TLS settings"
+
+config APP_MQTT_BROKER_HOST
+	string "MQTT broker IPv6 address"
+	default "2001:db8::2"
+
+config APP_MQTT_BROKER_PORT
+	int "MQTT TLS broker port"
+	default 8883
+
+config APP_MQTT_CLIENT_ID
+	string "MQTT client ID"
+	default "nrf5340-ipsp-wolfmqtt"
+
+config APP_MQTT_TELEMETRY_TOPIC
+	string "MQTT telemetry topic"
+	default "nrf5340/telemetry"
+
+config APP_MQTT_COMMAND_TOPIC
+	string "MQTT command topic"
+	default "nrf5340/command"
+
+endmenu

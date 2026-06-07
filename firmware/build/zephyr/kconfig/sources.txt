@@ -1,0 +1,13 @@
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/Kconfig.sysbuild
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/Kconfig/Kconfig.sysbuild.modules
+/home/thiago/ncs/v2.6.0/nrf/sysbuild/Kconfig.bt_fast_pair
+/home/thiago/ncs/v2.6.0/nrf/sysbuild/Kconfig.dfu
+/home/thiago/ncs/v2.6.0/nrf/sysbuild/Kconfig.mcuboot
+/home/thiago/ncs/v2.6.0/nrf/sysbuild/Kconfig.netcore
+/home/thiago/ncs/v2.6.0/nrf/sysbuild/Kconfig.secureboot
+/home/thiago/ncs/v2.6.0/nrf/sysbuild/Kconfig.sysbuild
+/home/thiago/ncs/v2.6.0/nrf/sysbuild/Kconfig.xip
+/home/thiago/ncs/v2.6.0/zephyr/modules/Kconfig.sysbuild
+/home/thiago/ncs/v2.6.0/zephyr/share/sysbuild/Kconfig
+/home/thiago/ncs/v2.6.0/zephyr/share/sysbuild/images/Kconfig
+/home/thiago/ncs/v2.6.0/zephyr/share/sysbuild/images/bootloader/Kconfig

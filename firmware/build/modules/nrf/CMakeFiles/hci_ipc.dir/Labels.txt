@@ -1,0 +1,13 @@
+# Target labels
+ hci_ipc
+# Source files and their labels
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/modules/nrf/CMakeFiles/hci_ipc
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/modules/nrf/CMakeFiles/hci_ipc.rule
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/modules/nrf/CMakeFiles/hci_ipc-complete.rule
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/modules/nrf/hci_ipc-prefix/src/hci_ipc-stamp/hci_ipc-build.rule
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/modules/nrf/hci_ipc-prefix/src/hci_ipc-stamp/hci_ipc-configure.rule
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/modules/nrf/hci_ipc-prefix/src/hci_ipc-stamp/hci_ipc-download.rule
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/modules/nrf/hci_ipc-prefix/src/hci_ipc-stamp/hci_ipc-install.rule
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/modules/nrf/hci_ipc-prefix/src/hci_ipc-stamp/hci_ipc-mkdir.rule
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/modules/nrf/hci_ipc-prefix/src/hci_ipc-stamp/hci_ipc-patch.rule
+/home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/modules/nrf/hci_ipc-prefix/src/hci_ipc-stamp/hci_ipc-update.rule
