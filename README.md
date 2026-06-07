@@ -214,6 +214,54 @@ MQTT TX nrf5340/telemetry: counter:N
 MQTT command: led:on
 ```
 
+## 8. Console interativo da placa
+
+Para acompanhar a serial da placa e mandar comandos MQTT curtos no mesmo
+terminal:
+
+```sh
+cd /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
+./scripts/board_console.sh
+```
+
+O script monitora `/dev/ttyACM1` com `tio`, assina `nrf5340/telemetry` e abre um
+prompt interativo. Comandos:
+
+```text
+connect                  conecta IPSP usando F8:69:5E:1E:CE:2F random
+connect public           conecta o MAC padrao usando address type public
+connect AA:BB:CC:DD:EE:FF random
+connect AA:BB:CC:DD:EE:FF public
+broker on                inicia o wolfMQTT TLS broker local
+broker off               para o broker iniciado por este console
+broker restart           reinicia o broker
+broker status            mostra se o broker esta rodando neste console
+flash                    grava o firmware apos checar USB/J-Link via nrfutil
+on                       envia led:on
+off                      envia led:off
+toggle                   envia led:toggle
+status                   mostra configuracao atual
+help                     mostra ajuda
+quit                     sai
+```
+
+Variaveis uteis:
+
+```sh
+TTY_DEVICE=/dev/ttyACM1 ./scripts/board_console.sh
+IPSP_ADDR=AA:BB:CC:DD:EE:FF IPSP_ADDR_TYPE=public ./scripts/board_console.sh
+SERIAL_NUMBER=1050032722 ./scripts/board_console.sh
+SHOW_TELEMETRY=0 ./scripts/board_console.sh
+MQTT_HOST=127.0.0.1 MQTT_PORT=8883 ./scripts/board_console.sh
+```
+
+O comando `flash` chama `scripts/flash_firmware.sh`. Antes disso, ele consulta
+`nrfutil device list` e so continua se encontrar o serial configurado em
+`SERIAL_NUMBER`.
+
+O broker iniciado por `broker on` e finalizado automaticamente quando
+`board_console.sh` sai.
+
 ## Notas de implementacao
 
 - O firmware usa TLS 1.3 classico com wolfSSL. PQC/ML-KEM ficou desabilitado no
