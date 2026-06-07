@@ -36,7 +36,9 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 #define MQTT_BUFFER_SIZE 2048
 #define MQTT_CMD_TIMEOUT_MS 5000
 #define MQTT_KEEPALIVE_SEC 30
-#define MQTT_WAIT_TIMEOUT_MS 5000
+#define MQTT_WAIT_TIMEOUT_MS 1000
+#define MQTT_POLL_TIMEOUT_MS 500
+#define MQTT_PING_IDLE_MS 20000
 #define MQTT_TELEMETRY_INTERVAL_MS 10000
 #define BLE_IPSP_WRITE_CHUNK 96
 
@@ -355,6 +357,40 @@ static int mqtt_publish_counter(uint32_t counter)
 	return rc;
 }
 
+static int mqtt_socket_poll(int timeout_ms)
+{
+	struct zsock_pollfd pfd = {
+		.fd = sock_ctx.fd,
+		.events = ZSOCK_POLLIN,
+	};
+	int rc;
+
+	if (sock_ctx.fd < 0) {
+		return MQTT_CODE_ERROR_NETWORK;
+	}
+
+	rc = zsock_poll(&pfd, 1, timeout_ms);
+	if (rc < 0) {
+		printk("poll failed: errno=%d\n", errno);
+		return MQTT_CODE_ERROR_NETWORK;
+	}
+
+	if (rc == 0) {
+		return MQTT_CODE_ERROR_TIMEOUT;
+	}
+
+	if (pfd.revents & (ZSOCK_POLLERR | ZSOCK_POLLHUP | ZSOCK_POLLNVAL)) {
+		printk("poll socket error: revents=0x%x\n", pfd.revents);
+		return MQTT_CODE_ERROR_NETWORK;
+	}
+
+	if (pfd.revents & ZSOCK_POLLIN) {
+		return MQTT_CODE_SUCCESS;
+	}
+
+	return MQTT_CODE_ERROR_TIMEOUT;
+}
+
 static bool network_ready(void)
 {
 	struct net_if *iface = net_if_get_default();
@@ -409,20 +445,31 @@ int main(void)
 
 		int64_t next_telemetry = k_uptime_get() +
 					 MQTT_TELEMETRY_INTERVAL_MS;
+		int64_t last_mqtt_tx = k_uptime_get();
 
 		while (1) {
-			rc = MqttClient_WaitMessage(&mqtt_client,
-						    MQTT_WAIT_TIMEOUT_MS);
-			if (rc == MQTT_CODE_ERROR_TIMEOUT) {
+			rc = mqtt_socket_poll(MQTT_POLL_TIMEOUT_MS);
+			if (rc == MQTT_CODE_SUCCESS) {
+				rc = MqttClient_WaitMessage(&mqtt_client,
+							    MQTT_WAIT_TIMEOUT_MS);
+				if (rc != MQTT_CODE_SUCCESS &&
+				    rc != MQTT_CODE_ERROR_TIMEOUT) {
+					printk("wait message failed: %d\n", rc);
+					break;
+				}
+			} else if (rc != MQTT_CODE_ERROR_TIMEOUT) {
+				printk("socket poll failed: %d\n", rc);
+				break;
+			}
+
+			if (k_uptime_get() - last_mqtt_tx >= MQTT_PING_IDLE_MS) {
 				rc = MqttClient_Ping(&mqtt_client);
 				if (rc != MQTT_CODE_SUCCESS) {
 					printk("MQTT ping failed: %d\n", rc);
 					break;
 				}
 				printk("MQTT ping ok\n");
-			} else if (rc != MQTT_CODE_SUCCESS) {
-				printk("wait message failed: %d\n", rc);
-				break;
+				last_mqtt_tx = k_uptime_get();
 			}
 
 			if (k_uptime_get() >= next_telemetry) {
@@ -433,6 +480,7 @@ int main(void)
 				}
 				next_telemetry = k_uptime_get() +
 						 MQTT_TELEMETRY_INTERVAL_MS;
+				last_mqtt_tx = k_uptime_get();
 			}
 
 			k_sleep(K_MSEC(100));

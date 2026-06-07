@@ -228,6 +228,8 @@ O script monitora `/dev/ttyACM1` com `tio`, assina `nrf5340/telemetry` e abre um
 prompt interativo. Comandos:
 
 ```text
+build broker             compila host/build/wolfmqtt-broker
+build firmware           compila firmware/build/merged.hex e merged_CPUNET.hex
 connect                  conecta IPSP usando F8:69:5E:1E:CE:2F random
 connect public           conecta o MAC padrao usando address type public
 connect AA:BB:CC:DD:EE:FF random
@@ -253,7 +255,12 @@ IPSP_ADDR=AA:BB:CC:DD:EE:FF IPSP_ADDR_TYPE=public ./scripts/board_console.sh
 SERIAL_NUMBER=1050032722 ./scripts/board_console.sh
 SHOW_TELEMETRY=0 ./scripts/board_console.sh
 MQTT_HOST=127.0.0.1 MQTT_PORT=8883 ./scripts/board_console.sh
+NCS_VERSION=v2.6.0 BOARD=nrf5340dk_nrf5340_cpuapp ./scripts/board_console.sh
 ```
+
+O comando `build broker` chama `host/build_wolf_broker.sh`. O comando
+`build firmware` chama `nrfutil sdk-manager toolchain launch` com `west build`
+usando `NCS_VERSION`, `NCS_CHDIR` e `BOARD`.
 
 O comando `flash` chama `scripts/flash_firmware.sh`. Antes disso, ele consulta
 `nrfutil device list` e so continua se encontrar o serial configurado em

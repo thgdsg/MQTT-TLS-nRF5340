@@ -17,6 +17,9 @@ IPSP_ADDR="${IPSP_ADDR:-F8:69:5E:1E:CE:2F}"
 IPSP_ADDR_TYPE="${IPSP_ADDR_TYPE:-2}"
 NRFUTIL="${NRFUTIL:-/home/thiago/.local/bin/nrfutil}"
 SERIAL_NUMBER="${SERIAL_NUMBER:-1050032722}"
+NCS_VERSION="${NCS_VERSION:-v2.6.0}"
+NCS_CHDIR="${NCS_CHDIR:-/home/thiago/ncs/v2.6.0/nrf}"
+BOARD="${BOARD:-nrf5340dk_nrf5340_cpuapp_ns}"
 
 SERIAL_PID=""
 TELEMETRY_PID=""
@@ -53,8 +56,15 @@ Environment overrides:
   IPSP_ADDR_TYPE=${IPSP_ADDR_TYPE}
   NRFUTIL=${NRFUTIL}
   SERIAL_NUMBER=${SERIAL_NUMBER}
+  NCS_VERSION=${NCS_VERSION}
+  NCS_CHDIR=${NCS_CHDIR}
+  BOARD=${BOARD}
 
 Interactive commands:
+  build broker
+           build host/build/wolfmqtt-broker
+  build firmware
+           build firmware/build/merged.hex and merged_CPUNET.hex
   connect [mac] [random|public|1|2]
            run host/ipsp_connect.sh. Defaults: ${IPSP_ADDR} ${IPSP_ADDR_TYPE}
   broker on|off|restart|status
@@ -75,6 +85,55 @@ require_command()
 		printf 'Required command not found: %s\n' "$1" >&2
 		exit 1
 	fi
+}
+
+run_build_broker()
+{
+	local build_script="${ROOT_DIR}/host/build_wolf_broker.sh"
+
+	if [ ! -x "${build_script}" ]; then
+		printf '[build] broker build script not found or not executable: %s\n' "${build_script}" >&2
+		return 1
+	fi
+
+	printf '[build] building broker\n'
+	"${build_script}"
+}
+
+run_build_firmware()
+{
+	if [ ! -x "${NRFUTIL}" ]; then
+		printf '[build] nrfutil not found at %s\n' "${NRFUTIL}" >&2
+		return 1
+	fi
+
+	printf '[build] building firmware with NCS %s board %s\n' "${NCS_VERSION}" "${BOARD}"
+	env SHELL=/bin/bash "${NRFUTIL}" sdk-manager toolchain launch \
+		--ncs-version "${NCS_VERSION}" \
+		--chdir "${NCS_CHDIR}" \
+		-- west build \
+		-d "${ROOT_DIR}/firmware/build" \
+		-b "${BOARD}" \
+		--sysbuild \
+		-p always \
+		"${ROOT_DIR}/firmware"
+}
+
+handle_build_command()
+{
+	case "${1:-}" in
+	broker)
+		run_build_broker
+		;;
+	firmware)
+		run_build_firmware
+		;;
+	*)
+		printf 'Unknown build command: %s\n' "${1:-}" >&2
+		printf 'Use: build broker or build firmware.\n' >&2
+		return 1
+		;;
+	esac
 }
 
 mqtt_args()
@@ -305,6 +364,9 @@ print_status()
 [status] default IPSP peer: ${IPSP_ADDR} addr_type=${IPSP_ADDR_TYPE}
 [status] nrfutil: ${NRFUTIL}
 [status] nRF serial number: ${SERIAL_NUMBER}
+[status] NCS version: ${NCS_VERSION}
+[status] NCS chdir: ${NCS_CHDIR}
+[status] board: ${BOARD}
 EOF
 	broker_status
 }
@@ -369,7 +431,7 @@ main()
 	start_serial_monitor
 	start_telemetry_monitor
 	print_status
-	printf '[help] type broker, connect, flash, on, off, toggle, status, help, or quit\n'
+	printf '[help] type build, broker, connect, flash, on, off, toggle, status, help, or quit\n'
 
 	while true; do
 		printf '> '
@@ -380,6 +442,12 @@ main()
 		set -- ${line}
 
 		case "${1:-}" in
+		build)
+			shift
+			if ! handle_build_command "$@"; then
+				printf '[build] command failed\n' >&2
+			fi
+			;;
 		connect)
 			shift
 			if ! run_ipsp_connect "$@"; then
