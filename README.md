@@ -52,7 +52,7 @@ sudo pacman -S openssl mosquitto bluez bluez-utils iproute2
 Os modulos wolf nao sao versionados no repositorio. Baixe-os localmente:
 
 ```sh
-cd /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
+cd /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
 ./scripts/fetch_wolf_modules.sh
 ```
 
@@ -85,8 +85,8 @@ patches/zephyr-v2.6.0-l2cap-tx-metadata.patch
 Aplique no Zephyr do NCS `v2.6.0`:
 
 ```sh
-cd /home/thiago/ncs/v2.6.0/zephyr
-git apply /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/patches/zephyr-v2.6.0-l2cap-tx-metadata.patch
+cd /home/[USER]/ncs/v2.6.0/zephyr
+git apply /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/patches/zephyr-v2.6.0-l2cap-tx-metadata.patch
 ```
 
 Se o patch ja estiver aplicado, o `git apply` pode falhar dizendo que os hunks
@@ -99,7 +99,7 @@ git diff -- subsys/bluetooth/host/l2cap.c
 ## 3. Gerar certificados TLS
 
 ```sh
-cd /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
+cd /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
 ./host/gen_tls_certs.sh 2001:db8::2 localhost
 ```
 
@@ -112,22 +112,22 @@ A CA gerada em `host/certs/ca.crt` esta embutida em
 Build:
 
 ```sh
-cd /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
-env SHELL=/bin/bash /home/thiago/.local/bin/nrfutil sdk-manager toolchain launch \
+cd /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
+env SHELL=/bin/bash /home/[USER]/.local/bin/nrfutil sdk-manager toolchain launch \
   --ncs-version v2.6.0 \
-  --chdir /home/thiago/ncs/v2.6.0/nrf \
+  --chdir /home/[USER]/ncs/v2.6.0/nrf \
   -- west build \
-     -d /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build \
+     -d /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build \
      -b nrf5340dk_nrf5340_cpuapp \
      --sysbuild \
      -p always \
-     /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware
+     /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware
 ```
 
 Flash:
 
 ```sh
-cd /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
+cd /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
 ./scripts/flash_firmware.sh
 ```
 
@@ -146,7 +146,7 @@ tio /dev/ttyACM1 -b 115200
 Com a placa ligada e anunciando `nRF5340 IPSP MQTT TLS`, conecte o host:
 
 ```sh
-cd /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
+cd /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
 sudo ./host/ipsp_connect.sh F8:69:5E:1E:CE:2F 2
 ```
 
@@ -171,7 +171,7 @@ ping -6 -c 3 -I bt0 2001:db8::1
 ## 6. Rodar o broker TLS no host
 
 ```sh
-cd /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
+cd /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
 ./host/build_wolf_broker.sh
 ./host/run_wolf_broker.sh
 ```
@@ -185,7 +185,7 @@ local em `host/build/wolfssl-install` e gera o executavel
 Assinar telemetria:
 
 ```sh
-cd /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
+cd /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
 mosquitto_sub -h 127.0.0.1 -p 8883 \
   --cafile host/certs/ca.crt \
   --insecure \
