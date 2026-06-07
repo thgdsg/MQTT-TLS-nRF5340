@@ -1,2 +1,11 @@
-modules/*
-tools
+firmware/build/
+host/build/
+modules/
+tools/
+
+*.elf
+*.hex
+*.bin
+*.map
+*.obj
+*.a

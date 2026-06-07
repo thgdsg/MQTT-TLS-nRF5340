@@ -1,0 +1,213 @@
+diff --git a/subsys/bluetooth/host/l2cap.c b/subsys/bluetooth/host/l2cap.c
+index b8faa1efcae..1180b1e2aea 100644
+--- a/subsys/bluetooth/host/l2cap.c
++++ b/subsys/bluetooth/host/l2cap.c
+@@ -10,6 +10,7 @@
+ #include <zephyr/kernel.h>
+ #include <string.h>
+ #include <errno.h>
++#include <stdint.h>
+ #include <zephyr/sys/atomic.h>
+ #include <zephyr/sys/iterable_sections.h>
+ #include <zephyr/sys/byteorder.h>
+@@ -84,6 +85,20 @@ struct l2cap_tx_meta {
+ static struct l2cap_tx_meta_data l2cap_tx_meta_data_storage[CONFIG_BT_CONN_TX_MAX];
+ K_FIFO_DEFINE(free_l2cap_tx_meta_data);
+ 
++static bool valid_tx_meta_data(const struct l2cap_tx_meta_data *data)
++{
++	uintptr_t ptr = (uintptr_t)data;
++	uintptr_t start = (uintptr_t)&l2cap_tx_meta_data_storage[0];
++	uintptr_t end = (uintptr_t)&l2cap_tx_meta_data_storage[CONFIG_BT_CONN_TX_MAX];
++
++	/* Guard TX completion callbacks from stale or overwritten user_data. */
++	if (!data || ptr < start || ptr >= end) {
++		return false;
++	}
++
++	return ((ptr - start) % sizeof(l2cap_tx_meta_data_storage[0])) == 0;
++}
++
+ static struct l2cap_tx_meta_data *alloc_tx_meta_data(void)
+ {
+ 	return k_fifo_get(&free_l2cap_tx_meta_data, K_NO_WAIT);
+@@ -908,7 +923,8 @@ static struct net_buf *l2cap_chan_le_get_tx_buf(struct bt_l2cap_le_chan *ch)
+ }
+ 
+ static int l2cap_chan_le_send_sdu(struct bt_l2cap_le_chan *ch,
+-				  struct net_buf **buf, uint16_t sent);
++				  struct net_buf **buf, uint16_t sent,
++				  struct l2cap_tx_meta_data *data);
+ 
+ static void l2cap_chan_tx_process(struct k_work *work)
+ {
+@@ -919,13 +935,25 @@ static void l2cap_chan_tx_process(struct k_work *work)
+ 
+ 	/* Resume tx in case there are buffers in the queue */
+ 	while ((buf = l2cap_chan_le_get_tx_buf(ch))) {
+-		int sent = l2cap_tx_meta_data(buf)->sent;
++		struct l2cap_tx_meta_data *data = l2cap_tx_meta_data(buf);
++		int sent;
++
++		/* Queued buffers must still point to our L2CAP metadata pool. */
++		if (!valid_tx_meta_data(data)) {
++			LOG_ERR("Dropping buffer with invalid L2CAP TX metadata %p",
++				data);
++			net_buf_unref(buf);
++			continue;
++		}
++
++		sent = data->sent;
+ 
+ 		LOG_DBG("buf %p sent %u", buf, sent);
+ 
+-		sent = l2cap_chan_le_send_sdu(ch, &buf, sent);
++		sent = l2cap_chan_le_send_sdu(ch, &buf, sent, data);
+ 		if (sent < 0) {
+ 			if (sent == -EAGAIN) {
++				l2cap_tx_meta_data(buf) = data;
+ 				ch->tx_buf = buf;
+ 				/* If we don't reschedule, and the app doesn't nudge l2cap (e.g. by
+ 				 * sending another SDU), the channel will be stuck in limbo. To
+@@ -1893,9 +1921,18 @@ static void l2cap_chan_sdu_sent(struct bt_conn *conn, void *user_data, int err)
+ {
+ 	struct l2cap_tx_meta_data *data = user_data;
+ 	struct bt_l2cap_chan *chan;
+-	bt_conn_tx_cb_t cb = data->cb;
+-	void *cb_user_data = data->user_data;
+-	uint16_t cid = data->cid;
++	bt_conn_tx_cb_t cb;
++	void *cb_user_data;
++	uint16_t cid;
++
++	if (!valid_tx_meta_data(data)) {
++		LOG_ERR("Ignoring invalid L2CAP TX metadata %p", data);
++		return;
++	}
++
++	cb = data->cb;
++	cb_user_data = data->user_data;
++	cid = data->cid;
+ 
+ 	LOG_DBG("conn %p CID 0x%04x err %d", conn, cid, err);
+ 
+@@ -1932,6 +1969,11 @@ static void l2cap_chan_seg_sent(struct bt_conn *conn, void *user_data, int err)
+ 	struct l2cap_tx_meta_data *data = user_data;
+ 	struct bt_l2cap_chan *chan;
+ 
++	if (!valid_tx_meta_data(data)) {
++		LOG_ERR("Ignoring invalid L2CAP TX metadata %p", data);
++		return;
++	}
++
+ 	LOG_DBG("conn %p CID 0x%04x err %d", conn, data->cid, err);
+ 
+ 	if (err) {
+@@ -1974,7 +2016,8 @@ static bool test_and_dec(atomic_t *target)
+  * be sent later.
+  */
+ static int l2cap_chan_le_send(struct bt_l2cap_le_chan *ch,
+-			      struct net_buf *buf, uint16_t sdu_hdr_len)
++			      struct net_buf *buf, uint16_t sdu_hdr_len,
++			      struct l2cap_tx_meta_data *data)
+ {
+ 	struct net_buf *seg;
+ 	struct net_buf_simple_state state;
+@@ -1999,15 +2042,18 @@ static int l2cap_chan_le_send(struct bt_l2cap_le_chan *ch,
+ 
+ 	len = seg->len - sdu_hdr_len;
+ 
+-	/* Set a callback if there is no data left in the buffer */
++	/* Pass cached metadata explicitly. bt_conn_send_cb() reuses
++	 * net_buf_user_data() for connection TX metadata, so reading the
++	 * L2CAP pointer from the buffer after this point can return garbage.
++	 */
+ 	if (buf == seg || !buf->len) {
+ 		err = bt_l2cap_send_cb(ch->chan.conn, ch->tx.cid, seg,
+ 				       l2cap_chan_sdu_sent,
+-				       l2cap_tx_meta_data(buf));
++				       data);
+ 	} else {
+ 		err = bt_l2cap_send_cb(ch->chan.conn, ch->tx.cid, seg,
+ 				       l2cap_chan_seg_sent,
+-				       l2cap_tx_meta_data(buf));
++				       data);
+ 	}
+ 
+ 	if (err) {
+@@ -2044,7 +2090,8 @@ static int l2cap_chan_le_send(struct bt_l2cap_le_chan *ch,
+ }
+ 
+ static int l2cap_chan_le_send_sdu(struct bt_l2cap_le_chan *ch,
+-				  struct net_buf **buf, uint16_t sent)
++				  struct net_buf **buf, uint16_t sent,
++				  struct l2cap_tx_meta_data *data)
+ {
+ 	int ret, total_len;
+ 	struct net_buf *frag;
+@@ -2062,11 +2109,13 @@ static int l2cap_chan_le_send_sdu(struct bt_l2cap_le_chan *ch,
+ 
+ 	if (!sent) {
+ 		/* Add SDU length for the first segment */
+-		ret = l2cap_chan_le_send(ch, frag, BT_L2CAP_SDU_HDR_SIZE);
++		ret = l2cap_chan_le_send(ch, frag, BT_L2CAP_SDU_HDR_SIZE,
++					 data);
+ 		if (ret < 0) {
+ 			if (ret == -EAGAIN) {
+-				/* Store sent data into user_data */
+-				l2cap_tx_meta_data(frag)->sent = sent;
++				/* Preserve resume state before queueing again. */
++				data->sent = sent;
++				l2cap_tx_meta_data(frag) = data;
+ 			}
+ 			*buf = frag;
+ 			return ret;
+@@ -2081,11 +2130,12 @@ static int l2cap_chan_le_send_sdu(struct bt_l2cap_le_chan *ch,
+ 			frag = net_buf_frag_del(NULL, frag);
+ 		}
+ 
+-		ret = l2cap_chan_le_send(ch, frag, 0);
++		ret = l2cap_chan_le_send(ch, frag, 0, data);
+ 		if (ret < 0) {
+ 			if (ret == -EAGAIN) {
+-				/* Store sent data into user_data */
+-				l2cap_tx_meta_data(frag)->sent = sent;
++				/* Preserve resume state before queueing again. */
++				data->sent = sent;
++				l2cap_tx_meta_data(frag) = data;
+ 			}
+ 			*buf = frag;
+ 			return ret;
+@@ -3171,23 +3221,28 @@ int bt_l2cap_chan_send_cb(struct bt_l2cap_chan *chan, struct net_buf *buf, bt_co
+ 	data->user_data = user_data;
+ 	l2cap_tx_meta_data(buf) = data;
+ 
++	/* Cache and pass the L2CAP metadata pointer while sending. It is stored
++	 * in net_buf_user_data() only while a buffer waits in our queue because
++	 * the lower connection layer overwrites that field during TX.
++	 */
+ 	/* Queue if there are pending segments left from previous packet or
+ 	 * there are no credits available.
+ 	 */
+ 	if (le_chan->tx_buf || !k_fifo_is_empty(&le_chan->tx_queue) ||
+ 	    !atomic_get(&le_chan->tx.credits)) {
+-		l2cap_tx_meta_data(buf)->sent = 0;
++		data->sent = 0;
+ 		net_buf_put(&le_chan->tx_queue, buf);
+ 		k_work_reschedule(&le_chan->tx_work, K_NO_WAIT);
+ 		return 0;
+ 	}
+ 
+-	err = l2cap_chan_le_send_sdu(le_chan, &buf, 0);
++	err = l2cap_chan_le_send_sdu(le_chan, &buf, 0, data);
+ 	if (err < 0) {
+-		if (err == -EAGAIN && l2cap_tx_meta_data(buf)->sent) {
++		if (err == -EAGAIN && data->sent) {
+ 			/* Queue buffer if at least one segment could be sent */
++			l2cap_tx_meta_data(buf) = data;
+ 			net_buf_put(&le_chan->tx_queue, buf);
+-			return l2cap_tx_meta_data(buf)->sent;
++			return data->sent;
+ 		}
+ 
+ 		LOG_ERR("failed to send message %d", err);

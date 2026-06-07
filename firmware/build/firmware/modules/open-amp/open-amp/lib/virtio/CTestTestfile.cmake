@@ -1,6 +1,0 @@
-# CMake generated Testfile for 
-# Source directory: /home/thiago/ncs/v2.6.0/modules/lib/open-amp/open-amp/lib/virtio
-# Build directory: /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/build/firmware/modules/open-amp/open-amp/lib/virtio
-# 
-# This file includes the relevant testing commands required for 
-# testing this directory and lists subdirectories to be tested as well.
