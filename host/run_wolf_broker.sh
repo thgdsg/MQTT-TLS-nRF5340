@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BROKER="${ROOT_DIR}/host/build/wolfmqtt-broker"
 CERT_DIR="${ROOT_DIR}/host/certs"
+KEYLOG_FILE="${WOLFMQTT_BROKER_KEYLOG_FILE:-${ROOT_DIR}/host/broker.sslkeylog}"
 
 if [ ! -x "${BROKER}" ]; then
     printf 'Broker not built. Run ./host/build_wolf_broker.sh first.\n'
@@ -14,6 +15,8 @@ if [ ! -f "${CERT_DIR}/server.crt" ] || [ ! -f "${CERT_DIR}/server.key" ]; then
     printf 'TLS certs not found. Run ./host/gen_tls_certs.sh first.\n'
     exit 1
 fi
+
+export WOLFMQTT_BROKER_KEYLOG_FILE="${KEYLOG_FILE}"
 
 exec "${BROKER}" \
     -t \

@@ -45,6 +45,14 @@ fi
 printf 'Enabling Bluetooth 6LoWPAN...\n'
 printf '1\n' > "${LOWPAN_ENABLE}"
 
+# A failed TLS/IPSP run can leave bt0 around with stale IPv6/TCP state. Bring
+# it down before asking bluetooth_6lowpan to create a fresh peer link.
+if ip link show bt0 >/dev/null 2>&1; then
+    printf 'Clearing stale bt0 network interface...\n'
+    ip link set bt0 down 2>/dev/null || true
+    ip address flush dev bt0 2>/dev/null || true
+fi
+
 # Print the cached bluetoothctl view before connecting. This is useful to
 # confirm the address type, bonding state, and IPSP service UUID.
 printf '\nBluetooth info for %s:\n' "${BLE_ADDR}"

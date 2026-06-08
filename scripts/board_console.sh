@@ -13,13 +13,24 @@ MQTT_COMMAND_TOPIC="${MQTT_COMMAND_TOPIC:-nrf5340/command}"
 MQTT_TELEMETRY_TOPIC="${MQTT_TELEMETRY_TOPIC:-nrf5340/telemetry}"
 MQTT_INSECURE="${MQTT_INSECURE:-1}"
 SHOW_TELEMETRY="${SHOW_TELEMETRY:-1}"
+PING_TIMEOUT_SEC="${PING_TIMEOUT_SEC:-8}"
+PING_CAPTURE_IFACE="${PING_CAPTURE_IFACE:-bt0}"
+PONG_LOG="${PONG_LOG:-${ROOT_DIR}/scripts/pong.log}"
+PONG_PCAP="${PONG_PCAP:-${ROOT_DIR}/scripts/pong_tls.pcap}"
+PONG_CAPTURE_LOG="${PONG_CAPTURE_LOG:-${ROOT_DIR}/scripts/pong_tcpdump.log}"
+PONG_LOG_MODE="${PONG_LOG_MODE:-tls_capture}"
+PONG_KEY_FILE="${PONG_KEY_FILE:-${ROOT_DIR}/scripts/pong.key}"
+BROKER_STOP_TIMEOUT_SEC="${BROKER_STOP_TIMEOUT_SEC:-1}"
 IPSP_ADDR="${IPSP_ADDR:-F8:69:5E:1E:CE:2F}"
 IPSP_ADDR_TYPE="${IPSP_ADDR_TYPE:-2}"
 NRFUTIL="${NRFUTIL:-/home/thiago/.local/bin/nrfutil}"
 SERIAL_NUMBER="${SERIAL_NUMBER:-1050032722}"
 NCS_VERSION="${NCS_VERSION:-v2.6.0}"
 NCS_CHDIR="${NCS_CHDIR:-/home/thiago/ncs/v2.6.0/nrf}"
-BOARD="${BOARD:-nrf5340dk_nrf5340_cpuapp_ns}"
+BOARD="${BOARD:-nrf5340dk_nrf5340_cpuapp}"
+PQC="${PQC:-on}"
+OQS_PREFIX="${OQS_PREFIX:-/home/thiago/Documents/canada/pesquisa/oqs-openssl/install}"
+OPENSSL_OQS_CONF="${OPENSSL_OQS_CONF:-${ROOT_DIR}/host/openssl-oqs.cnf}"
 
 SERIAL_PID=""
 TELEMETRY_PID=""
@@ -52,6 +63,14 @@ Environment overrides:
   MQTT_TELEMETRY_TOPIC=${MQTT_TELEMETRY_TOPIC}
   MQTT_INSECURE=${MQTT_INSECURE}
   SHOW_TELEMETRY=${SHOW_TELEMETRY}
+  PING_TIMEOUT_SEC=${PING_TIMEOUT_SEC}
+  PING_CAPTURE_IFACE=${PING_CAPTURE_IFACE}
+  PONG_LOG=${PONG_LOG}
+  PONG_PCAP=${PONG_PCAP}
+  PONG_CAPTURE_LOG=${PONG_CAPTURE_LOG}
+  PONG_LOG_MODE=${PONG_LOG_MODE}
+  PONG_KEY_FILE=${PONG_KEY_FILE}
+  BROKER_STOP_TIMEOUT_SEC=${BROKER_STOP_TIMEOUT_SEC}
   IPSP_ADDR=${IPSP_ADDR}
   IPSP_ADDR_TYPE=${IPSP_ADDR_TYPE}
   NRFUTIL=${NRFUTIL}
@@ -59,20 +78,26 @@ Environment overrides:
   NCS_VERSION=${NCS_VERSION}
   NCS_CHDIR=${NCS_CHDIR}
   BOARD=${BOARD}
+  PQC=${PQC}
+  OQS_PREFIX=${OQS_PREFIX}
+  OPENSSL_OQS_CONF=${OPENSSL_OQS_CONF}
 
 Interactive commands:
-  build broker
-           build host/build/wolfmqtt-broker
-  build firmware
-           build firmware/build/merged.hex and merged_CPUNET.hex
+  build broker [--pqc on|off]
+           build host/build/wolfmqtt-broker. Default PQC=${PQC}
+  build firmware [--pqc on|off]
+           build firmware/build/merged.hex and merged_CPUNET.hex. Default PQC=${PQC}
   connect [mac] [random|public|1|2]
            run host/ipsp_connect.sh. Defaults: ${IPSP_ADDR} ${IPSP_ADDR_TYPE}
   broker on|off|restart|status
            start, stop, restart, or inspect the local wolfMQTT TLS broker
+  broker clean-port
+           clear stale TCP state on ${MQTT_PORT} and refresh bt0 if needed
   flash    flash firmware after checking USB/J-Link connection
   on       publish led:on
   off      publish led:off
   toggle   publish led:toggle
+  ping     publish ping, wait for pong, and save an encrypted pong.log
   status   print current connection settings
   help     show this help
   quit     stop monitor and exit
@@ -90,24 +115,37 @@ require_command()
 run_build_broker()
 {
 	local build_script="${ROOT_DIR}/host/build_wolf_broker.sh"
+	local pqc
 
 	if [ ! -x "${build_script}" ]; then
 		printf '[build] broker build script not found or not executable: %s\n' "${build_script}" >&2
 		return 1
 	fi
 
-	printf '[build] building broker\n'
-	"${build_script}"
+	pqc="$(parse_pqc_option "$@")" || return 1
+
+	printf '[build] building broker PQC=%s\n' "${pqc}"
+	"${build_script}" --pqc "${pqc}"
 }
 
 run_build_firmware()
 {
+	local pqc
+	local cmake_args=()
+
 	if [ ! -x "${NRFUTIL}" ]; then
 		printf '[build] nrfutil not found at %s\n' "${NRFUTIL}" >&2
 		return 1
 	fi
 
-	printf '[build] building firmware with NCS %s board %s\n' "${NCS_VERSION}" "${BOARD}"
+	pqc="$(parse_pqc_option "$@")" || return 1
+	if [ "${pqc}" = "on" ]; then
+		cmake_args=()
+	else
+		cmake_args=(-DEXTRA_CONF_FILE="${ROOT_DIR}/firmware/pqc_off.conf")
+	fi
+
+	printf '[build] building firmware with NCS %s board %s PQC=%s\n' "${NCS_VERSION}" "${BOARD}" "${pqc}"
 	env SHELL=/bin/bash "${NRFUTIL}" sdk-manager toolchain launch \
 		--ncs-version "${NCS_VERSION}" \
 		--chdir "${NCS_CHDIR}" \
@@ -116,17 +154,58 @@ run_build_firmware()
 		-b "${BOARD}" \
 		--sysbuild \
 		-p always \
-		"${ROOT_DIR}/firmware"
+		"${ROOT_DIR}/firmware" \
+		-- "${cmake_args[@]}"
+}
+
+parse_pqc_option()
+{
+	local pqc="${PQC}"
+
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--pqc)
+			if [ "$#" -lt 2 ]; then
+				printf 'Missing value for --pqc. Use: --pqc on or --pqc off.\n' >&2
+				return 1
+			fi
+			pqc="${2:-}"
+			shift 2
+			;;
+		--pqc=*)
+			pqc="${1#--pqc=}"
+			shift
+			;;
+		*)
+			printf 'Unknown build option: %s\n' "$1" >&2
+			printf 'Use: --pqc on or --pqc off.\n' >&2
+			return 1
+			;;
+		esac
+	done
+
+	case "${pqc}" in
+	on | off)
+		printf '%s\n' "${pqc}"
+		;;
+	*)
+		printf 'Invalid PQC value: %s\n' "${pqc}" >&2
+		printf 'Use: --pqc on or --pqc off.\n' >&2
+		return 1
+		;;
+	esac
 }
 
 handle_build_command()
 {
 	case "${1:-}" in
 	broker)
-		run_build_broker
+		shift
+		run_build_broker "$@"
 		;;
 	firmware)
-		run_build_firmware
+		shift
+		run_build_firmware "$@"
 		;;
 	*)
 		printf 'Unknown build command: %s\n' "${1:-}" >&2
@@ -145,18 +224,233 @@ mqtt_args()
 	fi
 }
 
-publish_led()
+mqtt_env_args()
+{
+	# In PQC mode, force Mosquitto/OpenSSL through the OQS provider and MLKEM768.
+	if [ "${PQC}" != "on" ]; then
+		return
+	fi
+
+	printf '%s\n' \
+		"OPENSSL_CONF=${OPENSSL_OQS_CONF}" \
+		"OPENSSL_MODULES=${OQS_PREFIX}/lib/ossl-modules" \
+		"LD_LIBRARY_PATH=${OQS_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+}
+
+check_oqs_runtime()
+{
+	if [ "${PQC}" != "on" ]; then
+		return 0
+	fi
+
+	if [ ! -f "${OPENSSL_OQS_CONF}" ]; then
+		printf '[mqtt] OQS OpenSSL config not found: %s\n' "${OPENSSL_OQS_CONF}" >&2
+		return 1
+	fi
+
+	if [ ! -f "${OQS_PREFIX}/lib/ossl-modules/oqsprovider.so" ]; then
+		printf '[mqtt] oqsprovider.so not found under: %s\n' "${OQS_PREFIX}/lib/ossl-modules" >&2
+		return 1
+	fi
+
+	if [ ! -f "${OQS_PREFIX}/lib/liboqs.so" ] && [ ! -f "${OQS_PREFIX}/lib/liboqs.so.9" ]; then
+		printf '[mqtt] liboqs not found under: %s\n' "${OQS_PREFIX}/lib" >&2
+		return 1
+	fi
+}
+
+publish_mqtt_payload()
 {
 	local payload="$1"
 	local args=()
+	local env_args=()
+
+	if ! check_oqs_runtime; then
+		printf '[mqtt] publish failed before connect: OQS runtime is not ready\n' >&2
+		return 1
+	fi
+
+	mapfile -t args < <(mqtt_args)
+	mapfile -t env_args < <(mqtt_env_args)
+	env "${env_args[@]}" mosquitto_pub "${args[@]}" -t "${MQTT_COMMAND_TOPIC}" -m "${payload}"
+}
+
+publish_led()
+{
+	local payload="$1"
 
 	# Publish short prompt commands as the firmware's MQTT command payloads.
-	mapfile -t args < <(mqtt_args)
-	if mosquitto_pub "${args[@]}" -t "${MQTT_COMMAND_TOPIC}" -m "${payload}"; then
+	if publish_mqtt_payload "${payload}"; then
 		printf '[mqtt] sent %s -> %s\n' "${MQTT_COMMAND_TOPIC}" "${payload}"
 	else
 		printf '[mqtt] publish failed for payload: %s\n' "${payload}" >&2
 	fi
+}
+
+start_pong_capture()
+{
+	local capture_timeout="$((PING_TIMEOUT_SEC + 2))"
+	local tcpdump_cmd=()
+	local launch_cmd=()
+
+	rm -f "${PONG_PCAP}"
+	: > "${PONG_CAPTURE_LOG}"
+
+	if ! command -v tcpdump >/dev/null 2>&1; then
+		printf '[ping] tcpdump not found; encrypted capture not available\n' >&2
+		return 1
+	fi
+	if ! command -v timeout >/dev/null 2>&1; then
+		printf '[ping] timeout not found; encrypted capture not available\n' >&2
+		return 1
+	fi
+	if ! command -v setsid >/dev/null 2>&1; then
+		printf '[ping] setsid not found; encrypted capture not available\n' >&2
+		return 1
+	fi
+
+	tcpdump_cmd=(tcpdump -Z root -i "${PING_CAPTURE_IFACE}" -s 0 -U -w "${PONG_PCAP}" 'tcp port 8883')
+
+	if [ "$(id -u)" -eq 0 ]; then
+		launch_cmd=(setsid timeout "${capture_timeout}" "${tcpdump_cmd[@]}")
+	elif sudo -n true >/dev/null 2>&1; then
+		# Keep sudo outside setsid. Some sudo configs bind the timestamp to the
+		# terminal/session, so running sudo inside setsid can still ask for a
+		# password even after the user ran sudo -v.
+		launch_cmd=(sudo -n setsid timeout "${capture_timeout}" "${tcpdump_cmd[@]}")
+	else
+		printf '[ping] sudo is required for tcpdump; run sudo -v immediately before board_console.sh to fill %s\n' "${PONG_PCAP}" >&2
+		printf 'sudo timestamp was not available for non-interactive tcpdump\n' > "${PONG_CAPTURE_LOG}"
+		return 1
+	fi
+
+	# This pcap stores the encrypted TLS records seen on bt0.
+	"${launch_cmd[@]}" > "${PONG_CAPTURE_LOG}" 2>&1 &
+	printf '%s\n' "$!"
+}
+
+stop_pong_capture()
+{
+	local pid="$1"
+
+	if [ -n "${pid}" ]; then
+		kill -TERM "-${pid}" >/dev/null 2>&1 || kill "${pid}" >/dev/null 2>&1 || true
+		wait "${pid}" >/dev/null 2>&1 || true
+	fi
+}
+
+ensure_pong_key()
+{
+	if [ -f "${PONG_KEY_FILE}" ]; then
+		chmod 600 "${PONG_KEY_FILE}" 2>/dev/null || true
+		return 0
+	fi
+
+	if ! command -v openssl >/dev/null 2>&1; then
+		printf '[ping] openssl not found; cannot encrypt pong.log\n' >&2
+		return 1
+	fi
+
+	umask 077
+	openssl rand -base64 48 > "${PONG_KEY_FILE}"
+	chmod 600 "${PONG_KEY_FILE}" 2>/dev/null || true
+	printf '[ping] generated local pong log key: %s\n' "${PONG_KEY_FILE}"
+}
+
+save_encrypted_pong()
+{
+	if ! ensure_pong_key; then
+		return 1
+	fi
+
+	printf 'pong' |
+		openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+			-pass "file:${PONG_KEY_FILE}" \
+			-out "${PONG_LOG}"
+}
+
+ping_board()
+{
+	local args=()
+	local env_args=()
+	local sub_log
+	local sub_pid=""
+	local capture_pid=""
+	local deadline
+
+	if ! command -v mosquitto_sub >/dev/null 2>&1; then
+		printf '[ping] mosquitto_sub not found\n' >&2
+		return 1
+	fi
+	if ! check_oqs_runtime; then
+		printf '[ping] OQS runtime is not ready\n' >&2
+		return 1
+	fi
+
+	sub_log="$(mktemp)"
+	mapfile -t args < <(mqtt_args)
+	mapfile -t env_args < <(mqtt_env_args)
+
+	(
+		env "${env_args[@]}" mosquitto_sub "${args[@]}" -t "${MQTT_TELEMETRY_TOPIC}" 2>/dev/null
+	) > "${sub_log}" &
+	sub_pid="$!"
+
+	if [ "${PONG_LOG_MODE}" = "tls_capture" ]; then
+		capture_pid="$(start_pong_capture || true)"
+		sleep 0.4
+		if [ -n "${capture_pid}" ] && ! kill -0 "${capture_pid}" >/dev/null 2>&1; then
+			printf '[ping] tcpdump exited before ping; see %s\n' "${PONG_CAPTURE_LOG}" >&2
+		fi
+	else
+		: > "${PONG_LOG}"
+	fi
+	sleep 0.2
+
+	if publish_mqtt_payload ping; then
+		printf '[ping] sent %s -> ping\n' "${MQTT_COMMAND_TOPIC}"
+	else
+		printf '[ping] publish failed\n' >&2
+		kill "${sub_pid}" >/dev/null 2>&1 || true
+		wait "${sub_pid}" >/dev/null 2>&1 || true
+		stop_pong_capture "${capture_pid}"
+		rm -f "${sub_log}"
+		return 1
+	fi
+
+	deadline=$((SECONDS + PING_TIMEOUT_SEC))
+	while [ "${SECONDS}" -lt "${deadline}" ]; do
+		if grep -qx 'pong' "${sub_log}"; then
+			printf '[ping] received pong\n'
+			stop_pong_capture "${capture_pid}"
+			if [ "${PONG_LOG_MODE}" = "tls_capture" ]; then
+				if [ -s "${PONG_PCAP}" ]; then
+					printf '[ping] encrypted TLS pcap saved to %s\n' "${PONG_PCAP}"
+				else
+					printf '[ping] TLS pcap was not created; see %s\n' "${PONG_CAPTURE_LOG}" >&2
+				fi
+			elif save_encrypted_pong; then
+				printf '[ping] encrypted pong saved to %s\n' "${PONG_LOG}"
+			else
+				printf '[ping] failed to encrypt pong into %s\n' "${PONG_LOG}" >&2
+			fi
+			kill "${sub_pid}" >/dev/null 2>&1 || true
+			wait "${sub_pid}" >/dev/null 2>&1 || true
+			rm -f "${sub_log}"
+			return 0
+		fi
+		sleep 0.2
+	done
+
+	printf '[ping] timed out waiting for pong on %s\n' "${MQTT_TELEMETRY_TOPIC}" >&2
+	if [ "${PONG_LOG_MODE}" = "tls_capture" ]; then
+		printf '[ping] encrypted TLS pcap saved to %s if tcpdump was available\n' "${PONG_PCAP}" >&2
+	fi
+	kill "${sub_pid}" >/dev/null 2>&1 || true
+	wait "${sub_pid}" >/dev/null 2>&1 || true
+	stop_pong_capture "${capture_pid}"
+	rm -f "${sub_log}"
+	return 1
 }
 
 addr_type_to_number()
@@ -277,6 +571,65 @@ broker_running()
 	[ -n "${BROKER_PID}" ] && kill -0 "${BROKER_PID}" >/dev/null 2>&1
 }
 
+broker_port_busy()
+{
+	ss -ltn "sport = :${MQTT_PORT}" 2>/dev/null | grep -q ":${MQTT_PORT}"
+}
+
+broker_port_has_stale_tcp()
+{
+	ss -tn "sport = :${MQTT_PORT} or dport = :${MQTT_PORT}" 2>/dev/null |
+		awk 'NR > 1 { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+run_root_best_effort()
+{
+	if [ "$(id -u)" -eq 0 ]; then
+		"$@" >/dev/null 2>&1 || true
+	elif sudo -n true >/dev/null 2>&1; then
+		sudo -n "$@" >/dev/null 2>&1 || true
+	fi
+}
+
+clean_broker_port()
+{
+	printf '[broker] cleaning TCP state for port %s\n' "${MQTT_PORT}"
+
+	# ss -K asks the kernel to kill matching TCP sockets. It needs root, so it
+	# is best-effort unless the user already ran sudo -v or launched as root.
+	run_root_best_effort ss -K "sport = :${MQTT_PORT}"
+	run_root_best_effort ss -K "dport = :${MQTT_PORT}"
+
+	if broker_port_has_stale_tcp; then
+		printf '[broker] stale TCP state remains on %s:\n' "${MQTT_PORT}" >&2
+		ss -tnp "sport = :${MQTT_PORT} or dport = :${MQTT_PORT}" >&2 || true
+
+		# FIN-WAIT sockets on bt0 may persist when the BLE IPSP link died before
+		# TCP could finish closing. Cycling bt0 drops the dead path cleanly.
+		if ip link show bt0 >/dev/null 2>&1; then
+			printf '[broker] refreshing bt0 to drop stale IPSP socket state\n'
+			run_root_best_effort ip link set bt0 down
+			sleep 0.5
+			run_root_best_effort ip link set bt0 up
+			run_root_best_effort ip address add 2001:db8::2/64 dev bt0
+		fi
+	fi
+}
+
+wait_broker_port_free()
+{
+	local deadline=$((SECONDS + BROKER_STOP_TIMEOUT_SEC))
+
+	while broker_port_busy; do
+		if [ "${SECONDS}" -ge "${deadline}" ]; then
+			return 1
+		fi
+		sleep 0.2
+	done
+
+	return 0
+}
+
 start_broker()
 {
 	local broker_script="${ROOT_DIR}/host/run_wolf_broker.sh"
@@ -294,6 +647,21 @@ start_broker()
 		printf '[broker] setsid not found; install util-linux\n' >&2
 		return 1
 	fi
+	if ! command -v ss >/dev/null 2>&1; then
+		printf '[broker] ss not found; install iproute2\n' >&2
+		return 1
+	fi
+
+	clean_broker_port
+
+	if broker_port_busy; then
+		printf '[broker] waiting for port %s to become free\n' "${MQTT_PORT}"
+		if ! wait_broker_port_free; then
+			printf '[broker] port %s is still busy; current listener:\n' "${MQTT_PORT}" >&2
+			ss -ltnp "sport = :${MQTT_PORT}" >&2 || true
+			return 1
+		fi
+	fi
 
 	# Run the TLS broker in its own process group so broker off can stop it.
 	setsid bash -c '"$1" 2>&1 | sed -u "s/^/[broker] /"' bash "${broker_script}" &
@@ -310,13 +678,29 @@ stop_broker()
 
 	printf '[broker] stopping pid=%s\n' "${BROKER_PID}"
 	kill -TERM "-${BROKER_PID}" >/dev/null 2>&1 || kill "${BROKER_PID}" >/dev/null 2>&1 || true
+
+	local deadline=$((SECONDS + BROKER_STOP_TIMEOUT_SEC))
+	while kill -0 "${BROKER_PID}" >/dev/null 2>&1 && [ "${SECONDS}" -lt "${deadline}" ]; do
+		sleep 0.2
+	done
+	if kill -0 "${BROKER_PID}" >/dev/null 2>&1; then
+		printf '[broker] broker did not stop after %ss; killing process group\n' "${BROKER_STOP_TIMEOUT_SEC}" >&2
+		kill -KILL "-${BROKER_PID}" >/dev/null 2>&1 || kill -KILL "${BROKER_PID}" >/dev/null 2>&1 || true
+	fi
 	wait "${BROKER_PID}" >/dev/null 2>&1 || true
 	BROKER_PID=""
+
+	if ! wait_broker_port_free; then
+		printf '[broker] port %s is still busy after stopping broker:\n' "${MQTT_PORT}" >&2
+		ss -ltnp "sport = :${MQTT_PORT}" >&2 || true
+		return 1
+	fi
 }
 
 restart_broker()
 {
 	stop_broker
+	clean_broker_port
 	start_broker
 }
 
@@ -341,6 +725,9 @@ handle_broker_command()
 	restart)
 		restart_broker
 		;;
+	clean-port)
+		clean_broker_port
+		;;
 	status)
 		broker_status
 		;;
@@ -361,12 +748,20 @@ print_status()
 [status] command topic: ${MQTT_COMMAND_TOPIC}
 [status] telemetry topic: ${MQTT_TELEMETRY_TOPIC}
 [status] mqtt insecure verify: ${MQTT_INSECURE}
+[status] ping timeout: ${PING_TIMEOUT_SEC}s
+[status] ping capture iface: ${PING_CAPTURE_IFACE}
+[status] pong encrypted log: ${PONG_LOG}
+[status] pong TLS pcap: ${PONG_PCAP}
+[status] pong log mode: ${PONG_LOG_MODE}
 [status] default IPSP peer: ${IPSP_ADDR} addr_type=${IPSP_ADDR_TYPE}
 [status] nrfutil: ${NRFUTIL}
 [status] nRF serial number: ${SERIAL_NUMBER}
 [status] NCS version: ${NCS_VERSION}
 [status] NCS chdir: ${NCS_CHDIR}
 [status] board: ${BOARD}
+[status] default PQC build mode: ${PQC}
+[status] OQS prefix: ${OQS_PREFIX}
+[status] OpenSSL OQS config: ${OPENSSL_OQS_CONF}
 EOF
 	broker_status
 }
@@ -398,15 +793,22 @@ start_serial_monitor()
 start_telemetry_monitor()
 {
 	local args=()
+	local env_args=()
 
 	# Optionally mirror telemetry in the same terminal as the serial logs.
 	if [ "${SHOW_TELEMETRY}" != "1" ]; then
 		return
 	fi
 
+	if ! check_oqs_runtime; then
+		printf '[telemetry] OQS runtime is not ready; telemetry monitor not started\n' >&2
+		return
+	fi
+
 	mapfile -t args < <(mqtt_args)
+	mapfile -t env_args < <(mqtt_env_args)
 	(
-		mosquitto_sub "${args[@]}" -t "${MQTT_TELEMETRY_TOPIC}" 2>&1 |
+		env "${env_args[@]}" mosquitto_sub "${args[@]}" -t "${MQTT_TELEMETRY_TOPIC}" 2>&1 |
 			sed -u 's/^/[telemetry] /'
 	) &
 	TELEMETRY_PID="$!"
@@ -425,13 +827,16 @@ main()
 		printf 'CA file not found: %s\n' "${MQTT_CAFILE}" >&2
 		exit 1
 	fi
+	if ! check_oqs_runtime; then
+		exit 1
+	fi
 
 	trap cleanup EXIT INT TERM
 
 	start_serial_monitor
 	start_telemetry_monitor
 	print_status
-	printf '[help] type build, broker, connect, flash, on, off, toggle, status, help, or quit\n'
+	printf '[help] type build, broker, connect, flash, on, off, toggle, ping, status, help, or quit\n'
 
 	while true; do
 		printf '> '
@@ -474,6 +879,11 @@ main()
 			;;
 		toggle)
 			publish_led led:toggle
+			;;
+		ping)
+			if ! ping_board; then
+				printf '[ping] command failed\n' >&2
+			fi
 			;;
 		status)
 			print_status

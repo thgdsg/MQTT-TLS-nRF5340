@@ -33,14 +33,33 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 #define HAS_STATUS_LED 0
 #endif
 
-#define MQTT_BUFFER_SIZE 2048
+#define MQTT_BUFFER_SIZE 4096
 #define MQTT_CMD_TIMEOUT_MS 5000
+#define MQTT_TLS_HANDSHAKE_TIMEOUT_MS 60000
+#define MQTT_TLS_IO_TIMEOUT_MS 5000
 #define MQTT_KEEPALIVE_SEC 30
 #define MQTT_WAIT_TIMEOUT_MS 1000
 #define MQTT_POLL_TIMEOUT_MS 500
 #define MQTT_PING_IDLE_MS 20000
 #define MQTT_TELEMETRY_INTERVAL_MS 10000
-#define BLE_IPSP_WRITE_CHUNK 96
+#define BLE_IPSP_WRITE_CHUNK 64
+#define BLE_IPSP_WRITE_PAUSE_MS 10
+
+#ifndef APP_USE_PQC_TLS
+#if defined(CONFIG_WOLFSSL_MLKEM)
+#define APP_USE_PQC_TLS 1
+#else
+#define APP_USE_PQC_TLS 0
+#endif
+#endif
+
+#if APP_USE_PQC_TLS
+#define APP_TLS_MLKEM_GROUP WOLFSSL_ML_KEM_768
+
+#if !defined(WOLFSSL_HAVE_MLKEM)
+#error "This application requires wolfSSL standalone ML-KEM TLS support."
+#endif
+#endif
 
 /* Must match host/certs/ca.crt. Regenerate and replace if host certs change. */
 static const char ca_cert_pem[] =
@@ -64,6 +83,7 @@ static byte tx_buf[MQTT_BUFFER_SIZE];
 static byte rx_buf[MQTT_BUFFER_SIZE];
 static MqttClient mqtt_client;
 static MqttNet mqtt_net;
+static bool ping_requested;
 static struct socket_context sock_ctx = {
 	.fd = -1,
 };
@@ -99,6 +119,8 @@ static void handle_command(const byte *payload, word32 len)
 			(void)gpio_pin_toggle_dt(&led);
 		}
 #endif
+	} else if (strcmp(msg, "ping") == 0) {
+		ping_requested = true;
 	}
 }
 
@@ -132,6 +154,11 @@ static int set_socket_timeout(int fd, int optname, int timeout_ms)
 	};
 
 	return zsock_setsockopt(fd, SOL_SOCKET, optname, &tv, sizeof(tv));
+}
+
+static bool socket_errno_is_timeout(int err)
+{
+	return err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT;
 }
 
 static int net_connect(void *context, const char *host, word16 port,
@@ -188,7 +215,7 @@ static int net_read(void *context, byte *buf, int buf_len, int timeout_ms)
 	(void)set_socket_timeout(sock->fd, SO_RCVTIMEO, timeout_ms);
 	rc = zsock_recv(sock->fd, buf, buf_len, 0);
 	if (rc < 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+		if (socket_errno_is_timeout(errno)) {
 			return MQTT_CODE_ERROR_TIMEOUT;
 		}
 		printk("recv failed: errno=%d\n", errno);
@@ -216,11 +243,21 @@ static int net_write(void *context, const byte *buf, int buf_len, int timeout_ms
 	chunk_len = MIN(buf_len, BLE_IPSP_WRITE_CHUNK);
 	rc = zsock_send(sock->fd, buf, chunk_len, 0);
 	if (rc < 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+		if (socket_errno_is_timeout(errno)) {
 			return MQTT_CODE_ERROR_TIMEOUT;
 		}
 		printk("send failed: errno=%d\n", errno);
 		return MQTT_CODE_ERROR_NETWORK;
+	}
+
+	/*
+	 * IPSP/6LoWPAN over BLE has little buffering compared to normal Wi-Fi or
+	 * Ethernet. The ML-KEM TLS 1.3 handshake produces larger flights, so pace
+	 * partial writes to avoid overrunning Linux bluetooth_6lowpan/L2CAP and
+	 * making bt0 disappear mid-handshake.
+	 */
+	if (rc > 0 && rc < buf_len) {
+		k_sleep(K_MSEC(BLE_IPSP_WRITE_PAUSE_MS));
 	}
 
 	return rc;
@@ -231,6 +268,7 @@ static int net_disconnect(void *context)
 	struct socket_context *sock = context;
 
 	if (sock && sock->fd >= 0) {
+		(void)zsock_shutdown(sock->fd, SHUT_RDWR);
 		(void)zsock_close(sock->fd);
 		sock->fd = -1;
 	}
@@ -240,6 +278,11 @@ static int net_disconnect(void *context)
 
 static int tls_setup_cb(MqttClient *client)
 {
+#if APP_USE_PQC_TLS
+	int groups[] = {
+		APP_TLS_MLKEM_GROUP,
+	};
+#endif
 	int rc;
 
 	client->tls.ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
@@ -259,6 +302,17 @@ static int tls_setup_cb(MqttClient *client)
 		return WOLFSSL_FAILURE;
 	}
 
+#if APP_USE_PQC_TLS
+	rc = wolfSSL_CTX_set_groups(client->tls.ctx, groups, ARRAY_SIZE(groups));
+	if (rc != WOLFSSL_SUCCESS) {
+		printk("wolfSSL_CTX_set_groups ML-KEM failed: %d\n", rc);
+		return WOLFSSL_FAILURE;
+	}
+	printk("TLS 1.3 key exchange group: MLKEM768\n");
+#else
+	printk("TLS 1.3 key exchange group: wolfSSL classic default\n");
+#endif
+
 	return WOLFSSL_SUCCESS;
 }
 
@@ -270,6 +324,37 @@ static void mqtt_net_init(void)
 	mqtt_net.read = net_read;
 	mqtt_net.write = net_write;
 	mqtt_net.disconnect = net_disconnect;
+}
+
+static int mqtt_tls_net_connect(void)
+{
+	int64_t deadline = k_uptime_get() + MQTT_TLS_HANDSHAKE_TIMEOUT_MS;
+	int rc;
+
+	do {
+		rc = MqttClient_NetConnect(&mqtt_client,
+					   CONFIG_APP_MQTT_BROKER_HOST,
+					   CONFIG_APP_MQTT_BROKER_PORT,
+					   MQTT_TLS_IO_TIMEOUT_MS, 1,
+					   tls_setup_cb);
+		if (rc == MQTT_CODE_SUCCESS) {
+			return MQTT_CODE_SUCCESS;
+		}
+
+		if (rc != MQTT_CODE_CONTINUE &&
+		    rc != MQTT_CODE_ERROR_TIMEOUT) {
+			printk("MqttClient_NetConnect TLS failed: %d\n", rc);
+			(void)MqttClient_NetDisconnect(&mqtt_client);
+			return rc;
+		}
+
+		k_sleep(K_MSEC(100));
+	} while (k_uptime_get() < deadline);
+
+	printk("MqttClient_NetConnect TLS handshake timed out after %d ms\n",
+	       MQTT_TLS_HANDSHAKE_TIMEOUT_MS);
+	(void)MqttClient_NetDisconnect(&mqtt_client);
+	return MQTT_CODE_ERROR_TIMEOUT;
 }
 
 static int mqtt_connect_and_subscribe(void)
@@ -289,12 +374,8 @@ static int mqtt_connect_and_subscribe(void)
 		return rc;
 	}
 
-	rc = MqttClient_NetConnect(&mqtt_client,
-				   CONFIG_APP_MQTT_BROKER_HOST,
-				   CONFIG_APP_MQTT_BROKER_PORT,
-				   MQTT_CMD_TIMEOUT_MS, 1, tls_setup_cb);
+	rc = mqtt_tls_net_connect();
 	if (rc != MQTT_CODE_SUCCESS) {
-		printk("MqttClient_NetConnect TLS failed: %d\n", rc);
 		return rc;
 	}
 
@@ -347,6 +428,29 @@ static int mqtt_publish_counter(uint32_t counter)
 	publish.buffer = (byte *)payload;
 	publish.buffer_len = len;
 	publish.total_len = len;
+
+	rc = MqttClient_Publish(&mqtt_client, &publish);
+	if (rc == MQTT_CODE_SUCCESS) {
+		printk("MQTT TX %s: %s\n", CONFIG_APP_MQTT_TELEMETRY_TOPIC,
+		       payload);
+	}
+
+	return rc;
+}
+
+static int mqtt_publish_pong(void)
+{
+	MqttPublish publish;
+	static const char payload[] = "pong";
+	int rc;
+
+	memset(&publish, 0, sizeof(publish));
+	publish.topic_name = CONFIG_APP_MQTT_TELEMETRY_TOPIC;
+	publish.topic_name_len = strlen(CONFIG_APP_MQTT_TELEMETRY_TOPIC);
+	publish.qos = MQTT_QOS_0;
+	publish.buffer = (byte *)payload;
+	publish.buffer_len = strlen(payload);
+	publish.total_len = strlen(payload);
 
 	rc = MqttClient_Publish(&mqtt_client, &publish);
 	if (rc == MQTT_CODE_SUCCESS) {
@@ -460,6 +564,16 @@ int main(void)
 			} else if (rc != MQTT_CODE_ERROR_TIMEOUT) {
 				printk("socket poll failed: %d\n", rc);
 				break;
+			}
+
+			if (ping_requested) {
+				ping_requested = false;
+				rc = mqtt_publish_pong();
+				if (rc != MQTT_CODE_SUCCESS) {
+					printk("pong publish failed: %d\n", rc);
+					break;
+				}
+				last_mqtt_tx = k_uptime_get();
 			}
 
 			if (k_uptime_get() - last_mqtt_tx >= MQTT_PING_IDLE_MS) {

@@ -24,4 +24,8 @@
 #define NO_INT128
 #define NO_ASN_TIME_CHECK
 
+#ifdef CONFIG_WOLFSSL_MLKEM
+#define WOLFSSL_HAVE_MLKEM
+#endif
+
 #endif

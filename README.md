@@ -177,15 +177,84 @@ cd /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
 ```
 
 O broker escuta em TLS na porta `8883`. O build do host compila uma wolfSSL
-local em `host/build/wolfssl-install` e gera o executavel
-`host/build/wolfmqtt-broker`.
+local em `host/build/wolfssl-on-install` ou `host/build/wolfssl-off-install`
+e gera o executavel `host/build/wolfmqtt-broker`.
 
-## 7. Testar MQTT
+Para escolher se o broker usa PQC no handshake TLS:
+
+```sh
+./host/build_wolf_broker.sh --pqc on
+./host/build_wolf_broker.sh --pqc off
+```
+
+O executavel final continua sendo `host/build/wolfmqtt-broker`; rode o build
+com o mesmo modo PQC que voce pretende usar no firmware.
+
+## 7. TLS 1.3 com ML-KEM
+
+O firmware e o broker forcam o grupo TLS 1.3 standalone `MLKEM768`. O modo
+PQC atual nao anuncia fallback classico nem grupo hibrido para a conexao da
+placa ou para os comandos enviados via Mosquitto/OQS.
+
+O modo PQC fica ligado por padrao. Para desligar no firmware, use o overlay:
+
+```sh
+west build ... -- -DEXTRA_CONF_FILE=/home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/firmware/pqc_off.conf
+```
+
+Pelo console interativo, use:
+
+```text
+build broker --pqc on
+build firmware --pqc on
+build broker --pqc off
+build firmware --pqc off
+```
+
+O build do firmware habilita:
+
+- `WOLFSSL_MLKEM=yes`
+- `WOLFSSL_PQC_HYBRIDS=no`
+- `WOLFSSL_TLS_NO_MLKEM_STANDALONE=no`
+
+O broker aplica automaticamente o patch:
+
+```text
+patches/wolfmqtt-broker-force-mlkem-group.patch
+```
+
+Ao conectar, os logs esperados incluem:
+
+```text
+TLS 1.3 key exchange group: MLKEM768
+broker: TLS 1.3 group MLKEM768
+broker: TLS handshake done sock=N TLSv1.3
+```
+
+Os comandos `on`, `off` e `toggle` do `board_console.sh` tambem usam
+Mosquitto com o OQS provider quando `PQC=on`. Por padrao, o script espera o
+provider em:
+
+```text
+/home/thiago/Documents/canada/pesquisa/oqs-openssl/install
+```
+
+Para apontar para outro prefixo:
+
+```sh
+OQS_PREFIX=/caminho/para/oqs/install ./scripts/board_console.sh
+```
+
+## 8. Testar MQTT
 
 Assinar telemetria:
 
 ```sh
 cd /home/[USER]/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
+OQS_PREFIX=/home/thiago/Documents/canada/pesquisa/oqs-openssl/install
+OPENSSL_CONF=$PWD/host/openssl-oqs.cnf \
+OPENSSL_MODULES=$OQS_PREFIX/lib/ossl-modules \
+LD_LIBRARY_PATH=$OQS_PREFIX/lib \
 mosquitto_sub -h 127.0.0.1 -p 8883 \
   --cafile host/certs/ca.crt \
   --insecure \
@@ -195,12 +264,22 @@ mosquitto_sub -h 127.0.0.1 -p 8883 \
 Ligar/desligar/toggle do LED:
 
 ```sh
+OQS_PREFIX=/home/thiago/Documents/canada/pesquisa/oqs-openssl/install
+OPENSSL_CONF=$PWD/host/openssl-oqs.cnf \
+OPENSSL_MODULES=$OQS_PREFIX/lib/ossl-modules \
+LD_LIBRARY_PATH=$OQS_PREFIX/lib \
 mosquitto_pub -h 127.0.0.1 -p 8883 --cafile host/certs/ca.crt --insecure \
   -t nrf5340/command -m 'led:on'
 
+OPENSSL_CONF=$PWD/host/openssl-oqs.cnf \
+OPENSSL_MODULES=$OQS_PREFIX/lib/ossl-modules \
+LD_LIBRARY_PATH=$OQS_PREFIX/lib \
 mosquitto_pub -h 127.0.0.1 -p 8883 --cafile host/certs/ca.crt --insecure \
   -t nrf5340/command -m 'led:off'
 
+OPENSSL_CONF=$PWD/host/openssl-oqs.cnf \
+OPENSSL_MODULES=$OQS_PREFIX/lib/ossl-modules \
+LD_LIBRARY_PATH=$OQS_PREFIX/lib \
 mosquitto_pub -h 127.0.0.1 -p 8883 --cafile host/certs/ca.crt --insecure \
   -t nrf5340/command -m 'led:toggle'
 ```
@@ -214,7 +293,7 @@ MQTT TX nrf5340/telemetry: counter:N
 MQTT command: led:on
 ```
 
-## 8. Console interativo da placa
+## 9. Console interativo da placa
 
 Para acompanhar a serial da placa e mandar comandos MQTT curtos no mesmo
 terminal:
@@ -228,8 +307,10 @@ O script monitora `/dev/ttyACM1` com `tio`, assina `nrf5340/telemetry` e abre um
 prompt interativo. Comandos:
 
 ```text
-build broker             compila host/build/wolfmqtt-broker
-build firmware           compila firmware/build/merged.hex e merged_CPUNET.hex
+build broker [--pqc on|off]
+                         compila host/build/wolfmqtt-broker
+build firmware [--pqc on|off]
+                         compila firmware/build/merged.hex e merged_CPUNET.hex
 connect                  conecta IPSP usando F8:69:5E:1E:CE:2F random
 connect public           conecta o MAC padrao usando address type public
 connect AA:BB:CC:DD:EE:FF random
@@ -256,6 +337,8 @@ SERIAL_NUMBER=1050032722 ./scripts/board_console.sh
 SHOW_TELEMETRY=0 ./scripts/board_console.sh
 MQTT_HOST=127.0.0.1 MQTT_PORT=8883 ./scripts/board_console.sh
 NCS_VERSION=v2.6.0 BOARD=nrf5340dk_nrf5340_cpuapp ./scripts/board_console.sh
+OQS_PREFIX=/home/thiago/Documents/canada/pesquisa/oqs-openssl/install ./scripts/board_console.sh
+PQC=off ./scripts/board_console.sh
 ```
 
 O comando `build broker` chama `host/build_wolf_broker.sh`. O comando
@@ -271,8 +354,9 @@ O broker iniciado por `broker on` e finalizado automaticamente quando
 
 ## Notas de implementacao
 
-- O firmware usa TLS 1.3 classico com wolfSSL. PQC/ML-KEM ficou desabilitado no
-  firmware para estabilizar primeiro o transporte IPSP + MQTT/TLS.
+- O firmware usa TLS 1.3 com wolfSSL. Por padrao, o handshake forca o grupo
+  standalone `MLKEM768`; use `build firmware --pqc off` e
+  `build broker --pqc off` para testar o caminho TLS 1.3 classico.
 - O keepalive MQTT e mantido explicitamente: quando `MqttClient_WaitMessage()`
   retorna timeout, o firmware envia `MqttClient_Ping()`.
 - O broker foi usado em modo TLS-only na porta `8883`.
