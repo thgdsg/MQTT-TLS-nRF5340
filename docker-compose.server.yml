@@ -1,0 +1,31 @@
+services:
+  ipsp-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    image: ipsp-mqtt-tls-wolf-server:latest
+    container_name: ipsp-mqtt-tls-wolf-server
+    network_mode: host
+    privileged: true
+    stdin_open: true
+    tty: true
+    working_dir: /workspace/ipsp_mqtt_tls_wolf
+    environment:
+      ROOT_DIR: /workspace/ipsp_mqtt_tls_wolf
+      OQS_PREFIX: /opt/oqs
+      OPENSSL_CONF: /workspace/ipsp_mqtt_tls_wolf/host/openssl-oqs.cnf
+      OPENSSL_MODULES: /opt/oqs/lib/ossl-modules
+      LD_LIBRARY_PATH: /opt/oqs/lib
+      PQC: "on"
+      MQTT_HOST: 127.0.0.1
+      MQTT_PORT: "8883"
+      NCS_ZEPHYR_DIR: /ncs/v2.6.0/zephyr
+    volumes:
+      - .:/workspace/ipsp_mqtt_tls_wolf
+      - /var/run/dbus:/var/run/dbus
+      - /run/dbus:/run/dbus
+      - /sys/kernel/debug:/sys/kernel/debug
+      - /lib/modules:/lib/modules:ro
+      - /dev:/dev
+      - /home/thiago/ncs/v2.6.0:/ncs/v2.6.0
+    command: help

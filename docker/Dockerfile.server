@@ -1,0 +1,72 @@
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG OQS_PREFIX=/opt/oqs
+ARG LIBOQS_REF=main
+ARG OQS_PROVIDER_REF=main
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        autoconf \
+        automake \
+        bluez \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        dbus \
+        file \
+        git \
+        iproute2 \
+        iputils-ping \
+        kmod \
+        libssl-dev \
+        libtool \
+        mosquitto-clients \
+        ninja-build \
+        openssl \
+        patch \
+        pkg-config \
+        procps \
+        sudo \
+        tcpdump \
+        tio \
+        tshark \
+        util-linux && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch "${LIBOQS_REF}" https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs && \
+    cmake -S /tmp/liboqs -B /tmp/liboqs/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${OQS_PREFIX}" \
+        -DBUILD_SHARED_LIBS=ON && \
+    cmake --build /tmp/liboqs/build && \
+    cmake --install /tmp/liboqs/build && \
+    rm -rf /tmp/liboqs
+
+RUN git clone --depth 1 --branch "${OQS_PROVIDER_REF}" https://github.com/open-quantum-safe/oqs-provider.git /tmp/oqs-provider && \
+    cmake -S /tmp/oqs-provider -B /tmp/oqs-provider/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${OQS_PREFIX}" \
+        -DCMAKE_PREFIX_PATH="${OQS_PREFIX}" \
+        -DOPENSSL_ROOT_DIR=/usr \
+        -DOPENSSL_MODULES_PATH="${OQS_PREFIX}/lib/ossl-modules" && \
+    cmake --build /tmp/oqs-provider/build && \
+    cmake --install /tmp/oqs-provider/build && \
+    rm -rf /tmp/oqs-provider
+
+COPY docker/server-entrypoint.sh /usr/local/bin/ipsp-server
+RUN chmod +x /usr/local/bin/ipsp-server
+
+ENV OQS_PREFIX="${OQS_PREFIX}"
+ENV OPENSSL_MODULES="${OQS_PREFIX}/lib/ossl-modules"
+ENV LD_LIBRARY_PATH="${OQS_PREFIX}/lib"
+ENV ROOT_DIR=/workspace/ipsp_mqtt_tls_wolf
+ENV PQC=on
+ENV MQTT_HOST=127.0.0.1
+ENV MQTT_PORT=8883
+ENV NCS_ZEPHYR_DIR=/ncs/v2.6.0/zephyr
+
+WORKDIR /workspace/ipsp_mqtt_tls_wolf
+ENTRYPOINT ["/usr/local/bin/ipsp-server"]
+CMD ["help"]

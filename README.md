@@ -352,6 +352,107 @@ O comando `flash` chama `scripts/flash_firmware.sh`. Antes disso, ele consulta
 O broker iniciado por `broker on` e finalizado automaticamente quando
 `board_console.sh` sai.
 
+## 10. Container Docker para o server-side
+
+O repositorio inclui um runtime Docker para rodar o lado host/server do teste:
+
+- broker `wolfmqtt-broker` com wolfSSL;
+- `mosquitto_pub` e `mosquitto_sub`;
+- OpenSSL com OQS provider para `MLKEM768`;
+- ferramentas Linux para IPSP, como `bluez`, `iproute2`, `kmod`, `tcpdump`;
+- comando opcional para aplicar o patch do Zephyr/NCS `v2.6.0`.
+
+Importante: IPSP/IPv6-over-BLE depende do kernel Linux do host. Por isso o
+container usa `network_mode: host`, roda privilegiado e monta `/dev`,
+`/sys/kernel/debug`, `/var/run/dbus` e `/lib/modules`.
+
+No CachyOS/Arch, instale Docker se necessario:
+
+```sh
+sudo pacman -S docker docker-compose
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+```
+
+Depois faca logout/login para o grupo `docker` valer, ou use `sudo docker`.
+
+Build da imagem:
+
+```sh
+cd /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf
+docker compose -f docker-compose.server.yml build
+```
+
+Preparar dependencias do projeto dentro do volume montado:
+
+```sh
+docker compose -f docker-compose.server.yml run --rm ipsp-server setup
+```
+
+Esse comando baixa `modules/wolfssl`, `modules/wolfmqtt`, gera certificados se
+eles ainda nao existem e compila `host/build/wolfmqtt-broker`.
+
+Se quiser aplicar o patch IPSP no NCS `v2.6.0` montado em `/ncs/v2.6.0`:
+
+```sh
+docker compose -f docker-compose.server.yml run --rm ipsp-server apply-ncs-patch
+```
+
+Conectar IPSP e criar `bt0`:
+
+```sh
+docker compose -f docker-compose.server.yml run --rm ipsp-server \
+  connect F8:69:5E:1E:CE:2F 2
+```
+
+Rodar o broker TLS:
+
+```sh
+docker compose -f docker-compose.server.yml run --rm ipsp-server broker
+```
+
+Em outro terminal, enviar comandos MQTT:
+
+```sh
+docker compose -f docker-compose.server.yml run --rm ipsp-server pub led:on
+docker compose -f docker-compose.server.yml run --rm ipsp-server pub led:off
+docker compose -f docker-compose.server.yml run --rm ipsp-server pub led:toggle
+docker compose -f docker-compose.server.yml run --rm ipsp-server ping
+```
+
+Assinar telemetria:
+
+```sh
+docker compose -f docker-compose.server.yml run --rm ipsp-server sub
+```
+
+Limpar sockets presos na porta `8883` depois de falha no handshake:
+
+```sh
+docker compose -f docker-compose.server.yml run --rm ipsp-server clean-port
+```
+
+Verificar se o OQS provider esta carregado:
+
+```sh
+docker compose -f docker-compose.server.yml run --rm ipsp-server oqs-check
+```
+
+Tambem e possivel abrir um shell no ambiente:
+
+```sh
+docker compose -f docker-compose.server.yml run --rm ipsp-server shell
+```
+
+Limites do container:
+
+- ele cobre o lado server/host do teste;
+- o build/flash do firmware continua sendo mais simples fora do container com
+  `nrfutil sdk-manager`, como descrito nas secoes anteriores;
+- se voce gerar novos certificados dentro do container, a CA em
+  `firmware/src/main.c` precisa continuar igual ou o firmware deve ser
+  recompilado/regravado.
+
 ## Notas de implementacao
 
 - O firmware usa TLS 1.3 com wolfSSL. Por padrao, o handshake forca o grupo
