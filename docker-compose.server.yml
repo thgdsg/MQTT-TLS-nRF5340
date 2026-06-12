@@ -17,6 +17,7 @@ services:
       OPENSSL_MODULES: /opt/oqs/lib/ossl-modules
       LD_LIBRARY_PATH: /opt/oqs/lib
       PQC: "on"
+      BROKER_KEYLOG: "off"
       MQTT_HOST: 127.0.0.1
       MQTT_PORT: "8883"
       NCS_ZEPHYR_DIR: /ncs/v2.6.0/zephyr

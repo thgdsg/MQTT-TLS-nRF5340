@@ -1,7 +1,6 @@
-diff --git a/src/mqtt_broker.c b/src/mqtt_broker.c
 --- a/src/mqtt_broker.c
 +++ b/src/mqtt_broker.c
-@@ -33,6 +33,7 @@
+@@ -32,6 +32,7 @@
  
  #include <stdlib.h>
  #include <string.h>
@@ -9,12 +8,12 @@ diff --git a/src/mqtt_broker.c b/src/mqtt_broker.c
  
  #ifdef ENABLE_MQTT_TLS
      #include <wolfssl/wolfcrypt/random.h>
-@@ -84,6 +84,10 @@
+@@ -85,6 +86,39 @@
      #endif
  #endif
  
 +#ifndef WOLFMQTT_BROKER_TLS_HANDSHAKE_TIMEOUT_S
-+    #define WOLFMQTT_BROKER_TLS_HANDSHAKE_TIMEOUT_S 60
++    #define WOLFMQTT_BROKER_TLS_HANDSHAKE_TIMEOUT_S 30
 +#endif
 +
 +#if defined(WOLFMQTT_BROKER_KEYLOG_EXPORT) && \
@@ -47,9 +46,9 @@ diff --git a/src/mqtt_broker.c b/src/mqtt_broker.c
 +#endif
 +
  /* -------------------------------------------------------------------------- */
- /* Logging helpers                                                             */
+ /* Default sleep abstraction                                                   */
  /* -------------------------------------------------------------------------- */
-@@ -326,6 +326,25 @@ static int BrokerTls_Init(MqttBroker* broker)
+@@ -327,6 +361,24 @@
          mqtt_rc = MQTT_CODE_ERROR_MEMORY;
      }
  
@@ -74,7 +73,7 @@ diff --git a/src/mqtt_broker.c b/src/mqtt_broker.c
      /* Load server certificate */
      if (mqtt_rc == MQTT_CODE_SUCCESS) {
          if (broker->tls_cert == NULL) {
-@@ -391,6 +410,14 @@ static int BrokerTls_Init(MqttBroker* broker)
+@@ -376,6 +428,14 @@
          wolfSSL_CTX_SetIOSend(ctx, MqttSocket_TlsSocketSend);
      }
  
@@ -89,26 +88,45 @@ diff --git a/src/mqtt_broker.c b/src/mqtt_broker.c
      /* Mutual TLS: load CA and require client certificate */
      if (mqtt_rc == MQTT_CODE_SUCCESS && broker->tls_ca != NULL) {
  #ifndef NO_FILESYSTEM
-@@ -4116,6 +4135,19 @@ static int BrokerClient_Process(MqttBroker* broker, BrokerClient* bc)
-     /* Complete TLS handshake before processing MQTT packets */
-     if (!bc->tls_handshake_done) {
-         int ret;
-+        WOLFMQTT_BROKER_TIME_T now = WOLFMQTT_BROKER_GET_TIME_S();
-+        if ((now - bc->last_rx) >
-+            (WOLFMQTT_BROKER_TIME_T)WOLFMQTT_BROKER_TLS_HANDSHAKE_TIMEOUT_S) {
-+            WBLOG_ERR(broker,
-+                "broker: TLS handshake timeout sock=%d after %u sec",
-+                (int)bc->sock,
-+                (unsigned int)WOLFMQTT_BROKER_TLS_HANDSHAKE_TIMEOUT_S);
-+            BrokerSubs_RemoveClient(broker, bc);
-+            BrokerClient_Remove(broker, bc);
-+            return 0;
-+        }
-+
-         bc->client.tls.timeout_ms_read = BROKER_TIMEOUT_MS;
-         bc->client.tls.timeout_ms_write = BROKER_TIMEOUT_MS;
-         ret = wolfSSL_accept(bc->client.tls.ssl);
-@@ -806,6 +806,20 @@ static int BrokerPosix_Close(void* ctx, BROKER_SOCKET_T sock)
+@@ -590,17 +650,22 @@
+ static int BrokerPosix_Listen(void* ctx, BROKER_SOCKET_T* sock,
+     word16 port, int backlog)
+ {
+-    struct sockaddr_in addr;
++    struct sockaddr_in6 addr;
+     int opt = 1;
++    int v6only = 0;
+     BROKER_SOCKET_T fd;
+ 
+-    fd = socket(AF_INET, SOCK_STREAM, 0);
++    fd = socket(AF_INET6, SOCK_STREAM, 0);
+     if (fd < 0) {
+         WBLOG_ERR((MqttBroker*)ctx, "broker: socket failed (%d)", errno);
+         return MQTT_CODE_ERROR_NETWORK;
+     }
+ 
+     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
++#ifdef SO_REUSEPORT
++    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
++#endif
++    (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+ 
+     if (BrokerPosix_SetNonBlocking(fd) != MQTT_CODE_SUCCESS) {
+         WBLOG_ERR((MqttBroker*)ctx, "broker: set nonblocking failed (%d)", errno);
+@@ -609,9 +674,9 @@
+     }
+ 
+     XMEMSET(&addr, 0, sizeof(addr));
+-    addr.sin_family = AF_INET;
+-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+-    addr.sin_port = htons(port);
++    addr.sin6_family = AF_INET6;
++    addr.sin6_addr = in6addr_any;
++    addr.sin6_port = htons(port);
+ 
+     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+         WBLOG_ERR((MqttBroker*)ctx, "broker: bind failed (%d)", errno);
+@@ -751,6 +816,18 @@
  {
      (void)ctx;
      if (sock != BROKER_SOCKET_INVALID) {
@@ -127,3 +145,22 @@ diff --git a/src/mqtt_broker.c b/src/mqtt_broker.c
          close(sock);
      }
      return MQTT_CODE_SUCCESS;
+@@ -4097,6 +4174,18 @@
+     /* Complete TLS handshake before processing MQTT packets */
+     if (!bc->tls_handshake_done) {
+         int ret;
++        WOLFMQTT_BROKER_TIME_T now = WOLFMQTT_BROKER_GET_TIME_S();
++        if ((now - bc->last_rx) >
++            (WOLFMQTT_BROKER_TIME_T)WOLFMQTT_BROKER_TLS_HANDSHAKE_TIMEOUT_S) {
++            WBLOG_ERR(broker,
++                "broker: TLS handshake timeout sock=%d after %u sec",
++                (int)bc->sock,
++                (unsigned int)WOLFMQTT_BROKER_TLS_HANDSHAKE_TIMEOUT_S);
++            BrokerSubs_RemoveClient(broker, bc);
++            BrokerClient_Remove(broker, bc);
++            return 0;
++        }
++
+         bc->client.tls.timeout_ms_read = BROKER_TIMEOUT_MS;
+         bc->client.tls.timeout_ms_write = BROKER_TIMEOUT_MS;
+         ret = wolfSSL_accept(bc->client.tls.ssl);

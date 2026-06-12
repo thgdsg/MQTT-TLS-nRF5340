@@ -12,6 +12,7 @@ MQTT_CAFILE="${MQTT_CAFILE:-${ROOT_DIR}/host/certs/ca.crt}"
 MQTT_COMMAND_TOPIC="${MQTT_COMMAND_TOPIC:-nrf5340/command}"
 MQTT_TELEMETRY_TOPIC="${MQTT_TELEMETRY_TOPIC:-nrf5340/telemetry}"
 MQTT_INSECURE="${MQTT_INSECURE:-1}"
+MQTT_TLS_VERSION="${MQTT_TLS_VERSION:-tlsv1.3}"
 SHOW_TELEMETRY="${SHOW_TELEMETRY:-1}"
 PING_TIMEOUT_SEC="${PING_TIMEOUT_SEC:-8}"
 PING_CAPTURE_IFACE="${PING_CAPTURE_IFACE:-bt0}"
@@ -29,6 +30,7 @@ NCS_VERSION="${NCS_VERSION:-v2.6.0}"
 NCS_CHDIR="${NCS_CHDIR:-/home/thiago/ncs/v2.6.0/nrf}"
 BOARD="${BOARD:-nrf5340dk_nrf5340_cpuapp}"
 PQC="${PQC:-on}"
+BROKER_KEYLOG="${BROKER_KEYLOG:-off}"
 OQS_PREFIX="${OQS_PREFIX:-/home/thiago/Documents/canada/pesquisa/oqs-openssl/install}"
 OPENSSL_OQS_CONF="${OPENSSL_OQS_CONF:-${ROOT_DIR}/host/openssl-oqs.cnf}"
 
@@ -51,7 +53,11 @@ cleanup()
 usage()
 {
 	cat <<EOF
-Usage: $(basename "$0")
+Usage: $(basename "$0") [--docker|docker]
+
+Launcher modes:
+  --docker, docker
+           run this console inside the Docker server-side container
 
 Environment overrides:
   TTY_DEVICE=${TTY_DEVICE}
@@ -62,6 +68,7 @@ Environment overrides:
   MQTT_COMMAND_TOPIC=${MQTT_COMMAND_TOPIC}
   MQTT_TELEMETRY_TOPIC=${MQTT_TELEMETRY_TOPIC}
   MQTT_INSECURE=${MQTT_INSECURE}
+  MQTT_TLS_VERSION=${MQTT_TLS_VERSION}
   SHOW_TELEMETRY=${SHOW_TELEMETRY}
   PING_TIMEOUT_SEC=${PING_TIMEOUT_SEC}
   PING_CAPTURE_IFACE=${PING_CAPTURE_IFACE}
@@ -79,12 +86,13 @@ Environment overrides:
   NCS_CHDIR=${NCS_CHDIR}
   BOARD=${BOARD}
   PQC=${PQC}
+  BROKER_KEYLOG=${BROKER_KEYLOG}
   OQS_PREFIX=${OQS_PREFIX}
   OPENSSL_OQS_CONF=${OPENSSL_OQS_CONF}
 
 Interactive commands:
-  build broker [--pqc on|off]
-           build host/build/wolfmqtt-broker. Default PQC=${PQC}
+  build broker [--pqc on|off] [--keylog on|off]
+           build host/build/wolfmqtt-broker. Default PQC=${PQC}, KEYLOG=${BROKER_KEYLOG}
   build firmware [--pqc on|off]
            build firmware/build/merged.hex and merged_CPUNET.hex. Default PQC=${PQC}
   connect [mac] [random|public|1|2]
@@ -104,6 +112,52 @@ Interactive commands:
 EOF
 }
 
+docker_env_args()
+{
+	# Pass only portable runtime settings into the container. Path-like values
+	# such as ROOT_DIR, OQS_PREFIX, OPENSSL_OQS_CONF, and MQTT_CAFILE are owned
+	# by docker-compose/server-entrypoint inside the container.
+	printf '%s\n' \
+		-e "BOARD_CONSOLE_IN_DOCKER=1" \
+		-e "TTY_DEVICE=${TTY_DEVICE}" \
+		-e "BAUDRATE=${BAUDRATE}" \
+		-e "MQTT_HOST=${MQTT_HOST}" \
+		-e "MQTT_PORT=${MQTT_PORT}" \
+		-e "MQTT_COMMAND_TOPIC=${MQTT_COMMAND_TOPIC}" \
+		-e "MQTT_TELEMETRY_TOPIC=${MQTT_TELEMETRY_TOPIC}" \
+		-e "MQTT_INSECURE=${MQTT_INSECURE}" \
+		-e "MQTT_TLS_VERSION=${MQTT_TLS_VERSION}" \
+		-e "SHOW_TELEMETRY=${SHOW_TELEMETRY}" \
+		-e "PING_TIMEOUT_SEC=${PING_TIMEOUT_SEC}" \
+		-e "PING_CAPTURE_IFACE=${PING_CAPTURE_IFACE}" \
+		-e "PONG_LOG_MODE=${PONG_LOG_MODE}" \
+		-e "BROKER_STOP_TIMEOUT_SEC=${BROKER_STOP_TIMEOUT_SEC}" \
+		-e "IPSP_ADDR=${IPSP_ADDR}" \
+		-e "IPSP_ADDR_TYPE=${IPSP_ADDR_TYPE}" \
+		-e "SERIAL_NUMBER=${SERIAL_NUMBER}" \
+		-e "PQC=${PQC}" \
+		-e "BROKER_KEYLOG=${BROKER_KEYLOG}"
+}
+
+run_docker_console()
+{
+	local docker_script="${ROOT_DIR}/scripts/docker_server.sh"
+	local env_args=()
+
+	if [ "${BOARD_CONSOLE_IN_DOCKER:-0}" = "1" ]; then
+		printf 'Already running inside the Docker console container.\n' >&2
+		return 1
+	fi
+	if [ ! -x "${docker_script}" ]; then
+		printf 'Docker helper not found or not executable: %s\n' "${docker_script}" >&2
+		return 1
+	fi
+
+	mapfile -t env_args < <(docker_env_args)
+	printf '[docker] launching board console inside the server-side container\n'
+	exec "${docker_script}" run --rm "${env_args[@]}" ipsp-server console
+}
+
 require_command()
 {
 	if ! command -v "$1" >/dev/null 2>&1; then
@@ -116,6 +170,7 @@ run_build_broker()
 {
 	local build_script="${ROOT_DIR}/host/build_wolf_broker.sh"
 	local pqc
+	local keylog
 
 	if [ ! -x "${build_script}" ]; then
 		printf '[build] broker build script not found or not executable: %s\n' "${build_script}" >&2
@@ -123,9 +178,10 @@ run_build_broker()
 	fi
 
 	pqc="$(parse_pqc_option "$@")" || return 1
+	keylog="$(parse_keylog_option "$@")" || return 1
 
-	printf '[build] building broker PQC=%s\n' "${pqc}"
-	"${build_script}" --pqc "${pqc}"
+	printf '[build] building broker PQC=%s KEYLOG=%s\n' "${pqc}" "${keylog}"
+	"${build_script}" --pqc "${pqc}" --keylog "${keylog}"
 }
 
 run_build_firmware()
@@ -176,6 +232,16 @@ parse_pqc_option()
 			pqc="${1#--pqc=}"
 			shift
 			;;
+		--keylog)
+			if [ "$#" -lt 2 ]; then
+				printf 'Missing value for --keylog. Use: --keylog on or --keylog off.\n' >&2
+				return 1
+			fi
+			shift 2
+			;;
+		--keylog=*)
+			shift
+			;;
 		*)
 			printf 'Unknown build option: %s\n' "$1" >&2
 			printf 'Use: --pqc on or --pqc off.\n' >&2
@@ -191,6 +257,54 @@ parse_pqc_option()
 	*)
 		printf 'Invalid PQC value: %s\n' "${pqc}" >&2
 		printf 'Use: --pqc on or --pqc off.\n' >&2
+		return 1
+		;;
+	esac
+}
+
+parse_keylog_option()
+{
+	local keylog="${BROKER_KEYLOG}"
+
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--keylog)
+			if [ "$#" -lt 2 ]; then
+				printf 'Missing value for --keylog. Use: --keylog on or --keylog off.\n' >&2
+				return 1
+			fi
+			keylog="${2:-}"
+			shift 2
+			;;
+		--keylog=*)
+			keylog="${1#--keylog=}"
+			shift
+			;;
+		--pqc)
+			if [ "$#" -lt 2 ]; then
+				printf 'Missing value for --pqc. Use: --pqc on or --pqc off.\n' >&2
+				return 1
+			fi
+			shift 2
+			;;
+		--pqc=*)
+			shift
+			;;
+		*)
+			printf 'Unknown build option: %s\n' "$1" >&2
+			printf 'Use: --keylog on or --keylog off.\n' >&2
+			return 1
+			;;
+		esac
+	done
+
+	case "${keylog}" in
+	on | off)
+		printf '%s\n' "${keylog}"
+		;;
+	*)
+		printf 'Invalid keylog value: %s\n' "${keylog}" >&2
+		printf 'Use: --keylog on or --keylog off.\n' >&2
 		return 1
 		;;
 	esac
@@ -219,6 +333,9 @@ mqtt_args()
 {
 	# Print one MQTT CLI argument per line so callers can mapfile safely.
 	printf '%s\n' -h "${MQTT_HOST}" -p "${MQTT_PORT}" --cafile "${MQTT_CAFILE}"
+	if [ -n "${MQTT_TLS_VERSION}" ]; then
+		printf '%s\n' --tls-version "${MQTT_TLS_VERSION}"
+	fi
 	if [ "${MQTT_INSECURE}" = "1" ]; then
 		printf '%s\n' --insecure
 	fi
@@ -239,6 +356,9 @@ mqtt_env_args()
 
 check_oqs_runtime()
 {
+	local env_args=()
+	local tls_groups
+
 	if [ "${PQC}" != "on" ]; then
 		return 0
 	fi
@@ -255,6 +375,19 @@ check_oqs_runtime()
 
 	if [ ! -f "${OQS_PREFIX}/lib/liboqs.so" ] && [ ! -f "${OQS_PREFIX}/lib/liboqs.so.9" ]; then
 		printf '[mqtt] liboqs not found under: %s\n' "${OQS_PREFIX}/lib" >&2
+		return 1
+	fi
+
+	if ! command -v openssl >/dev/null 2>&1; then
+		printf '[mqtt] openssl not found; cannot verify OQS TLS groups\n' >&2
+		return 1
+	fi
+
+	mapfile -t env_args < <(mqtt_env_args)
+	tls_groups="$(env "${env_args[@]}" openssl list -tls1_3 -tls-groups 2>/dev/null || true)"
+	if ! printf '%s\n' "${tls_groups}" | grep -qi 'MLKEM768'; then
+		printf '[mqtt] OpenSSL/OQS is loaded, but MLKEM768 is not available as a TLS 1.3 group.\n' >&2
+		printf '[mqtt] Rebuild the Docker server image or fix your local OpenSSL/OQS provider before publishing.\n' >&2
 		return 1
 	fi
 }
@@ -633,6 +766,7 @@ wait_broker_port_free()
 start_broker()
 {
 	local broker_script="${ROOT_DIR}/host/run_wolf_broker.sh"
+	local connect_script="${ROOT_DIR}/host/ipsp_connect.sh"
 
 	if broker_running; then
 		printf '[broker] already running pid=%s\n' "${BROKER_PID}"
@@ -641,6 +775,10 @@ start_broker()
 
 	if [ ! -x "${broker_script}" ]; then
 		printf '[broker] broker script not found or not executable: %s\n' "${broker_script}" >&2
+		return 1
+	fi
+	if [ ! -x "${connect_script}" ]; then
+		printf '[broker] IPSP connect script not found or not executable: %s\n' "${connect_script}" >&2
 		return 1
 	fi
 	if ! command -v setsid >/dev/null 2>&1; then
@@ -663,10 +801,95 @@ start_broker()
 		fi
 	fi
 
-	# Run the TLS broker in its own process group so broker off can stop it.
-	setsid bash -c '"$1" 2>&1 | sed -u "s/^/[broker] /"' bash "${broker_script}" &
+	# Run a broker supervisor in its own process group. If the TLS handshake
+	# times out, the supervisor restarts the broker and recreates the IPSP link.
+	setsid bash -c '
+set -euo pipefail
+
+broker_script="$1"
+connect_script="$2"
+ipsp_addr="$3"
+ipsp_type="$4"
+mqtt_port="$5"
+
+kill_port_state()
+{
+	ss -K "sport = :${mqtt_port}" >/dev/null 2>&1 || true
+	ss -K "dport = :${mqtt_port}" >/dev/null 2>&1 || true
+}
+
+wait_port_available()
+{
+	deadline=$((SECONDS + 8))
+
+	while ss -ltn "sport = :${mqtt_port}" 2>/dev/null | grep -q ":${mqtt_port}"; do
+		if [ "${SECONDS}" -ge "${deadline}" ]; then
+			printf "[broker] fail-safe: port %s still has a listener\n" "${mqtt_port}"
+			ss -ltnp "sport = :${mqtt_port}" || true
+			return 1
+		fi
+		sleep 0.2
+	done
+
+	return 0
+}
+
+run_reconnect()
+{
+	printf "[broker] fail-safe: reconnecting IPSP %s addr_type=%s\n" "${ipsp_addr}" "${ipsp_type}"
+	if [ "$(id -u)" -eq 0 ]; then
+		"${connect_script}" "${ipsp_addr}" "${ipsp_type}" 2>&1 | sed -u "s/^/[ipsp] /" || true
+	elif sudo -n true >/dev/null 2>&1; then
+		sudo -n "${connect_script}" "${ipsp_addr}" "${ipsp_type}" 2>&1 | sed -u "s/^/[ipsp] /" || true
+	else
+		printf "[broker] fail-safe: sudo timestamp unavailable; run sudo -v before starting broker\n"
+	fi
+}
+
+while true; do
+	recover_reason=""
+	kill_port_state
+	wait_port_available || true
+
+	coproc BROKER_PROC { "${broker_script}" 2>&1; }
+	broker_pid="${BROKER_PROC_PID}"
+
+	while IFS= read -r line <&"${BROKER_PROC[0]}"; do
+		printf "[broker] %s\n" "${line}"
+		case "${line}" in
+		*"TLS handshake timeout"*)
+			recover_reason="TLS handshake timeout"
+			printf "[broker] fail-safe: TLS handshake timeout detected, restarting broker and IPSP\n"
+			kill -TERM "${broker_pid}" >/dev/null 2>&1 || true
+			break
+			;;
+		*"bind failed"*|*"listen (TLS) failed"*|*"listen failed"*)
+			recover_reason="broker listen failure"
+			printf "[broker] fail-safe: broker listen failure detected, cleaning port and retrying\n"
+			kill -TERM "${broker_pid}" >/dev/null 2>&1 || true
+			break
+			;;
+		esac
+	done
+
+	kill -TERM "${broker_pid}" >/dev/null 2>&1 || true
+	wait "${broker_pid}" >/dev/null 2>&1 || true
+
+	if [ -z "${recover_reason}" ]; then
+		break
+	fi
+
+	kill_port_state
+	if [ "${recover_reason}" = "TLS handshake timeout" ]; then
+		run_reconnect
+	else
+		wait_port_available || sleep 2
+	fi
+	sleep 1
+done
+' bash "${broker_script}" "${connect_script}" "${IPSP_ADDR}" "${IPSP_ADDR_TYPE}" "${MQTT_PORT}" &
 	BROKER_PID="$!"
-	printf '[broker] started pid=%s\n' "${BROKER_PID}"
+	printf '[broker] supervisor started pid=%s\n' "${BROKER_PID}"
 }
 
 stop_broker()
@@ -748,6 +971,7 @@ print_status()
 [status] command topic: ${MQTT_COMMAND_TOPIC}
 [status] telemetry topic: ${MQTT_TELEMETRY_TOPIC}
 [status] mqtt insecure verify: ${MQTT_INSECURE}
+[status] mqtt TLS version: ${MQTT_TLS_VERSION}
 [status] ping timeout: ${PING_TIMEOUT_SEC}s
 [status] ping capture iface: ${PING_CAPTURE_IFACE}
 [status] pong encrypted log: ${PONG_LOG}
@@ -760,6 +984,7 @@ print_status()
 [status] NCS chdir: ${NCS_CHDIR}
 [status] board: ${BOARD}
 [status] default PQC build mode: ${PQC}
+[status] broker keylog build mode: ${BROKER_KEYLOG}
 [status] OQS prefix: ${OQS_PREFIX}
 [status] OpenSSL OQS config: ${OPENSSL_OQS_CONF}
 EOF
@@ -904,4 +1129,19 @@ main()
 	done
 }
 
-main "$@"
+case "${1:-}" in
+--docker | docker)
+	shift
+	if [ "$#" -gt 0 ]; then
+		printf 'Docker console mode does not accept extra arguments yet: %s\n' "$*" >&2
+		exit 1
+	fi
+	run_docker_console
+	;;
+--help | -h)
+	usage
+	;;
+*)
+	main "$@"
+	;;
+esac

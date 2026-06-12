@@ -1,39 +1,35 @@
-FROM ubuntu:24.04
+FROM archlinux:latest
 
-ARG DEBIAN_FRONTEND=noninteractive
 ARG OQS_PREFIX=/opt/oqs
 ARG LIBOQS_REF=main
 ARG OQS_PROVIDER_REF=main
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+RUN pacman -Syu --noconfirm && \
+    pacman -S --noconfirm --needed \
         autoconf \
         automake \
+        base-devel \
         bluez \
-        build-essential \
-        ca-certificates \
+        bluez-utils \
         cmake \
-        curl \
         dbus \
         file \
         git \
         iproute2 \
-        iputils-ping \
+        iputils \
         kmod \
-        libssl-dev \
         libtool \
-        mosquitto-clients \
-        ninja-build \
+        mosquitto \
+        ninja \
         openssl \
         patch \
-        pkg-config \
-        procps \
+        pkgconf \
+        procps-ng \
         sudo \
         tcpdump \
-        tio \
-        tshark \
-        util-linux && \
-    rm -rf /var/lib/apt/lists/*
+        util-linux \
+        wireshark-cli && \
+    pacman -Scc --noconfirm
 
 RUN git clone --depth 1 --branch "${LIBOQS_REF}" https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs && \
     cmake -S /tmp/liboqs -B /tmp/liboqs/build -GNinja \
@@ -58,13 +54,15 @@ RUN git clone --depth 1 --branch "${OQS_PROVIDER_REF}" https://github.com/open-q
 COPY docker/server-entrypoint.sh /usr/local/bin/ipsp-server
 RUN chmod +x /usr/local/bin/ipsp-server
 
-ENV OQS_PREFIX="${OQS_PREFIX}"
-ENV OPENSSL_MODULES="${OQS_PREFIX}/lib/ossl-modules"
-ENV LD_LIBRARY_PATH="${OQS_PREFIX}/lib"
+ENV OQS_PREFIX=${OQS_PREFIX}
+ENV OPENSSL_MODULES=${OQS_PREFIX}/lib/ossl-modules
+ENV LD_LIBRARY_PATH=${OQS_PREFIX}/lib
 ENV ROOT_DIR=/workspace/ipsp_mqtt_tls_wolf
 ENV PQC=on
+ENV BROKER_KEYLOG=off
 ENV MQTT_HOST=127.0.0.1
 ENV MQTT_PORT=8883
+ENV MQTT_TLS_VERSION=tlsv1.3
 ENV NCS_ZEPHYR_DIR=/ncs/v2.6.0/zephyr
 
 WORKDIR /workspace/ipsp_mqtt_tls_wolf

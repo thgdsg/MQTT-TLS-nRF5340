@@ -4,12 +4,14 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-/workspace/ipsp_mqtt_tls_wolf}"
 OQS_PREFIX="${OQS_PREFIX:-/opt/oqs}"
 PQC="${PQC:-on}"
+BROKER_KEYLOG="${BROKER_KEYLOG:-off}"
 MQTT_HOST="${MQTT_HOST:-127.0.0.1}"
 MQTT_PORT="${MQTT_PORT:-8883}"
 MQTT_COMMAND_TOPIC="${MQTT_COMMAND_TOPIC:-nrf5340/command}"
 MQTT_TELEMETRY_TOPIC="${MQTT_TELEMETRY_TOPIC:-nrf5340/telemetry}"
 MQTT_CAFILE="${MQTT_CAFILE:-${ROOT_DIR}/host/certs/ca.crt}"
 MQTT_INSECURE="${MQTT_INSECURE:-1}"
+MQTT_TLS_VERSION="${MQTT_TLS_VERSION:-tlsv1.3}"
 NCS_ZEPHYR_DIR="${NCS_ZEPHYR_DIR:-/ncs/v2.6.0/zephyr}"
 
 export OPENSSL_MODULES="${OPENSSL_MODULES:-${OQS_PREFIX}/lib/ossl-modules}"
@@ -25,7 +27,7 @@ Usage: ipsp-server <command> [args]
 
 Commands:
   setup                 fetch wolf modules, generate certs if needed, build broker
-  build-broker          build host/build/wolfmqtt-broker with PQC=${PQC}
+  build-broker          build host/build/wolfmqtt-broker with PQC=${PQC}, KEYLOG=${BROKER_KEYLOG}
   broker                run the wolfMQTT TLS broker on port ${MQTT_PORT}
   connect [mac] [type]  create bt0 using host/ipsp_connect.sh
   console               run scripts/board_console.sh inside the container
@@ -53,6 +55,17 @@ ensure_project()
     fi
 }
 
+trust_mounted_git_dirs()
+{
+    # The container usually runs as root while the bind-mounted repository and
+    # wolf modules are owned by the host user. Limit Git's safe.directory
+    # exception to the project paths this container is expected to manage.
+    git config --global --add safe.directory "${ROOT_DIR}" >/dev/null 2>&1 || true
+    git config --global --add safe.directory "${ROOT_DIR}/modules/wolfssl" >/dev/null 2>&1 || true
+    git config --global --add safe.directory "${ROOT_DIR}/modules/wolfmqtt" >/dev/null 2>&1 || true
+    git config --global --add safe.directory "${NCS_ZEPHYR_DIR}" >/dev/null 2>&1 || true
+}
+
 ensure_certs()
 {
     if [ ! -f "${ROOT_DIR}/host/certs/server.crt" ] ||
@@ -65,14 +78,18 @@ ensure_certs()
 setup_runtime()
 {
     ensure_project
+    trust_mounted_git_dirs
     "${ROOT_DIR}/scripts/fetch_wolf_modules.sh"
     ensure_certs
-    "${ROOT_DIR}/host/build_wolf_broker.sh" --pqc "${PQC}"
+    "${ROOT_DIR}/host/build_wolf_broker.sh" --pqc "${PQC}" --keylog "${BROKER_KEYLOG}"
 }
 
 mqtt_args()
 {
     printf '%s\n' -h "${MQTT_HOST}" -p "${MQTT_PORT}" --cafile "${MQTT_CAFILE}"
+    if [ -n "${MQTT_TLS_VERSION}" ]; then
+        printf '%s\n' --tls-version "${MQTT_TLS_VERSION}"
+    fi
     if [ "${MQTT_INSECURE}" = "1" ]; then
         printf '%s\n' --insecure
     fi
@@ -140,9 +157,18 @@ apply_ncs_patch()
 
 oqs_check()
 {
+    local tls_groups
+
     openssl list -providers
     printf '\nTLS groups containing MLKEM:\n'
-    openssl list -tls1_3 -tls-groups 2>/dev/null | grep -i 'mlkem\|kem' || true
+    tls_groups="$(openssl list -tls1_3 -tls-groups 2>/dev/null || true)"
+    printf '%s\n' "${tls_groups}" | grep -i 'mlkem\|kem' || true
+
+    if ! printf '%s\n' "${tls_groups}" | grep -qi 'MLKEM768'; then
+        printf '\nERROR: MLKEM768 is not available as an OpenSSL TLS 1.3 group.\n' >&2
+        printf 'Rebuild this Docker image with the Arch-based Dockerfile.server.\n' >&2
+        return 1
+    fi
 }
 
 cmd="${1:-help}"
@@ -154,7 +180,8 @@ setup)
     ;;
 build-broker)
     ensure_project
-    "${ROOT_DIR}/host/build_wolf_broker.sh" --pqc "${PQC}"
+    trust_mounted_git_dirs
+    "${ROOT_DIR}/host/build_wolf_broker.sh" --pqc "${PQC}" --keylog "${BROKER_KEYLOG}"
     ;;
 broker)
     ensure_project
@@ -167,6 +194,7 @@ connect)
     ;;
 console)
     ensure_project
+    export BOARD_CONSOLE_IN_DOCKER=1
     exec "${ROOT_DIR}/scripts/board_console.sh"
     ;;
 pub)
@@ -182,6 +210,7 @@ clean-port)
     clean_port
     ;;
 apply-ncs-patch)
+    trust_mounted_git_dirs
     apply_ncs_patch
     ;;
 oqs-check)

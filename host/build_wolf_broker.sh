@@ -6,17 +6,20 @@ WOLFSSL_DIR="${ROOT_DIR}/modules/wolfssl"
 WOLFMQTT_DIR="${ROOT_DIR}/modules/wolfmqtt"
 BUILD_DIR="${ROOT_DIR}/host/build"
 PQC="${PQC:-on}"
+KEYLOG="${KEYLOG:-off}"
 OUT="${BUILD_DIR}/wolfmqtt-broker"
 BROKER_MLKEM_PATCH="${ROOT_DIR}/patches/wolfmqtt-broker-force-mlkem-group.patch"
 
 usage()
 {
     cat <<EOF
-Usage: $(basename "$0") [--pqc on|off]
+Usage: $(basename "$0") [--pqc on|off] [--keylog on|off]
 
 Options:
   --pqc on    build broker with TLS 1.3 standalone MLKEM768 key exchange
   --pqc off   build broker with classic TLS 1.3 key exchange
+  --keylog on enable TLS keylog callback for pcap decryption
+  --keylog off disable TLS keylog callback. Default
 EOF
 }
 
@@ -32,6 +35,18 @@ while [ "$#" -gt 0 ]; do
         ;;
     --pqc=*)
         PQC="${1#--pqc=}"
+        shift
+        ;;
+    --keylog)
+        if [ "$#" -lt 2 ]; then
+            printf 'Missing value for --keylog. Use: --keylog on or --keylog off\n' >&2
+            exit 1
+        fi
+        KEYLOG="${2:-}"
+        shift 2
+        ;;
+    --keylog=*)
+        KEYLOG="${1#--keylog=}"
         shift
         ;;
     -h | --help)
@@ -56,8 +71,20 @@ on | off)
     ;;
 esac
 
-if [ "${PQC}" = "on" ]; then
-    WOLFSSL_PREFIX="${BUILD_DIR}/wolfssl-mlkem768-install"
+case "${KEYLOG}" in
+on | off)
+    ;;
+*)
+    printf 'Invalid --keylog value: %s\n' "${KEYLOG}" >&2
+    printf 'Use: --keylog on or --keylog off\n' >&2
+    exit 1
+    ;;
+esac
+
+if [ "${PQC}" = "on" ] && [ "${KEYLOG}" = "on" ]; then
+    WOLFSSL_PREFIX="${BUILD_DIR}/wolfssl-mlkem768-keylog-install"
+elif [ "${PQC}" = "on" ]; then
+    WOLFSSL_PREFIX="${BUILD_DIR}/wolfssl-mlkem768-nokeylog-install"
 else
     WOLFSSL_PREFIX="${BUILD_DIR}/wolfssl-off-install"
 fi
@@ -104,9 +131,11 @@ if [ ! -f "${WOLFSSL_PREFIX}/lib/libwolfssl.a" ]; then
             --enable-mlkem
             --enable-tls-mlkem-standalone
             --disable-pqc-hybrids
-            --enable-keylog-export
             --enable-opensslextra
         )
+        if [ "${KEYLOG}" = "on" ]; then
+            configure_args+=(--enable-keylog-export)
+        fi
     else
         configure_args+=(
             --disable-mlkem
@@ -133,7 +162,12 @@ if [ "${PQC}" = "on" ]; then
 #define WOLFMQTT_BROKER_FORCE_MLKEM_GROUP
 #define WOLFMQTT_BROKER_MLKEM_GROUP WOLFSSL_ML_KEM_768
 #define WOLFMQTT_BROKER_TLS_GROUPS WOLFMQTT_BROKER_MLKEM_GROUP
-#define WOLFMQTT_BROKER_TLS_HANDSHAKE_TIMEOUT_S 60
+#define WOLFMQTT_BROKER_TLS_HANDSHAKE_TIMEOUT_S 30
+EOF
+fi
+
+if [ "${KEYLOG}" = "on" ]; then
+    cat >> "${ROOT_DIR}/host/wolfmqtt/options.h" <<'EOF'
 #define WOLFMQTT_BROKER_KEYLOG_EXPORT
 EOF
 fi
@@ -154,4 +188,4 @@ cc -O2 -Wall -Wextra \
     "${WOLFSSL_PREFIX}/lib/libwolfssl.a" \
     -lm -lpthread
 
-printf 'Built %s (PQC=%s)\n' "${OUT}" "${PQC}"
+printf 'Built %s (PQC=%s, KEYLOG=%s)\n' "${OUT}" "${PQC}" "${KEYLOG}"
