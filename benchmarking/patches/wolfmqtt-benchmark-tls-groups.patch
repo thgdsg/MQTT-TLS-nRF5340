@@ -1,0 +1,27 @@
+--- a/src/mqtt_broker.c
++++ b/src/mqtt_broker.c
+@@ -327,6 +327,24 @@ static int BrokerTls_Init(MqttBroker* broker)
+         mqtt_rc = MQTT_CODE_ERROR_MEMORY;
+     }
+ 
++#ifdef WOLFMQTT_BROKER_FORCE_MLKEM_GROUP
++    if (mqtt_rc == MQTT_CODE_SUCCESS) {
++        int groups[] = { WOLFMQTT_BROKER_TLS_GROUPS };
++
++        wolf_rc = wolfSSL_CTX_set_groups(ctx, groups,
++            (int)(sizeof(groups) / sizeof(groups[0])));
++        if (wolf_rc != WOLFSSL_SUCCESS) {
++            WBLOG_ERR(broker, "broker: set TLS groups failed %d",
++                wolf_rc);
++            mqtt_rc = MQTT_CODE_ERROR_BAD_ARG;
++        }
++        else {
++            WBLOG_INFO(broker, "broker: TLS 1.3 group %s",
++                WOLFMQTT_BROKER_TLS_GROUP_NAME);
++        }
++    }
++#endif
++
+     /* Load server certificate */
+     if (mqtt_rc == MQTT_CODE_SUCCESS) {
+         if (broker->tls_cert == NULL) {

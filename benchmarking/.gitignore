@@ -1,0 +1,6 @@
+work/
+results/
+cases/*.csv
+!cases/.gitkeep
+__pycache__/
+*.pyc

@@ -1,0 +1,68 @@
+FROM archlinux:latest
+
+ARG OQS_PREFIX=/opt/oqs
+ARG LIBOQS_REF=main
+ARG OQS_PROVIDER_REF=main
+
+RUN pacman -Syu --noconfirm && \
+    pacman -S --noconfirm --needed \
+        autoconf \
+        automake \
+        base-devel \
+        bluez \
+        bluez-utils \
+        cmake \
+        dbus \
+        file \
+        git \
+        iproute2 \
+        iputils \
+        kmod \
+        libtool \
+        mosquitto \
+        ninja \
+        openssl \
+        patch \
+        perl \
+        pkgconf \
+        procps-ng \
+        python \
+        sudo \
+        tcpdump \
+        util-linux \
+        wireshark-cli && \
+    pacman -Scc --noconfirm
+
+RUN git clone --depth 1 --branch "${LIBOQS_REF}" https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs && \
+    cmake -S /tmp/liboqs -B /tmp/liboqs/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${OQS_PREFIX}" \
+        -DBUILD_SHARED_LIBS=ON && \
+    cmake --build /tmp/liboqs/build && \
+    cmake --install /tmp/liboqs/build && \
+    rm -rf /tmp/liboqs
+
+RUN git clone --depth 1 --branch "${OQS_PROVIDER_REF}" https://github.com/open-quantum-safe/oqs-provider.git /tmp/oqs-provider && \
+    cmake -S /tmp/oqs-provider -B /tmp/oqs-provider/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${OQS_PREFIX}" \
+        -DCMAKE_PREFIX_PATH="${OQS_PREFIX}" \
+        -DOPENSSL_ROOT_DIR=/usr \
+        -DOPENSSL_MODULES_PATH="${OQS_PREFIX}/lib/ossl-modules" && \
+    cmake --build /tmp/oqs-provider/build && \
+    cmake --install /tmp/oqs-provider/build && \
+    rm -rf /tmp/oqs-provider
+
+COPY benchmarking/docker/server-entrypoint-benchmark.sh /usr/local/bin/ipsp-benchmark
+RUN chmod +x /usr/local/bin/ipsp-benchmark
+
+ENV ROOT_DIR=/workspace/ipsp_mqtt_tls_wolf
+ENV OQS_PREFIX=${OQS_PREFIX}
+ENV OPENSSL_MODULES=${OQS_PREFIX}/lib/ossl-modules
+ENV LD_LIBRARY_PATH=${OQS_PREFIX}/lib
+ENV OPENSSL_CONF=/workspace/ipsp_mqtt_tls_wolf/benchmarking/work/openssl-benchmark.cnf
+ENV MQTT_PORT=8883
+
+WORKDIR /workspace/ipsp_mqtt_tls_wolf
+ENTRYPOINT ["/usr/local/bin/ipsp-benchmark"]
+CMD ["help"]

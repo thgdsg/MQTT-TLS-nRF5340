@@ -1,0 +1,52 @@
+cmake_minimum_required(VERSION 3.20.0)
+
+set(BOARD_FLASH_RUNNER nrfutil CACHE STRING "Use nrfutil for west flash" FORCE)
+
+set(PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(WOLFSSL_MODULE "${PROJECT_ROOT}/modules/wolfssl" CACHE PATH "wolfSSL module path")
+set(WOLFMQTT_MODULE "${PROJECT_ROOT}/modules/wolfmqtt" CACHE PATH "wolfMQTT module path")
+set(BENCH_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../work/generated/default" CACHE PATH "Generated benchmark headers")
+
+set(WOLFSSL_MLKEM "yes" CACHE STRING "Enable wolfSSL ML-KEM for TLS 1.3 PQC key exchange")
+set(WOLFSSL_PQC_HYBRIDS "no" CACHE STRING "Disable classical/PQC hybrid TLS groups")
+set(WOLFSSL_TLS_NO_MLKEM_STANDALONE "no" CACHE STRING "Allow standalone ML-KEM TLS groups")
+
+if(EXISTS "${WOLFSSL_MODULE}/zephyr/module.yml")
+  list(APPEND ZEPHYR_EXTRA_MODULES "${WOLFSSL_MODULE}")
+endif()
+
+if(EXISTS "${WOLFMQTT_MODULE}/zephyr/module.yml")
+  list(APPEND ZEPHYR_EXTRA_MODULES "${WOLFMQTT_MODULE}")
+endif()
+
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(ipsp_mqtt_tls_wolf_benchmark)
+
+if(CONFIG_APP_BENCH_TLS_GROUP_MLKEM512)
+  set(BENCH_TLS_GROUP "MLKEM512")
+  set(BENCH_TLS_GROUP_ID "WOLFSSL_ML_KEM_512")
+elseif(CONFIG_APP_BENCH_TLS_GROUP_MLKEM768)
+  set(BENCH_TLS_GROUP "MLKEM768")
+  set(BENCH_TLS_GROUP_ID "WOLFSSL_ML_KEM_768")
+elseif(CONFIG_APP_BENCH_TLS_GROUP_MLKEM1024)
+  set(BENCH_TLS_GROUP "MLKEM1024")
+  set(BENCH_TLS_GROUP_ID "WOLFSSL_ML_KEM_1024")
+elseif(CONFIG_APP_BENCH_TLS_GROUP_ECDHE_P256)
+  set(BENCH_TLS_GROUP "ECDHE-P-256")
+  set(BENCH_TLS_GROUP_ID "WOLFSSL_ECC_SECP256R1")
+elseif(CONFIG_APP_BENCH_TLS_GROUP_ECDHE_P384)
+  set(BENCH_TLS_GROUP "ECDHE-P-384")
+  set(BENCH_TLS_GROUP_ID "WOLFSSL_ECC_SECP384R1")
+elseif(CONFIG_APP_BENCH_TLS_GROUP_ECDHE_P521)
+  set(BENCH_TLS_GROUP "ECDHE-P-521")
+  set(BENCH_TLS_GROUP_ID "WOLFSSL_ECC_SECP521R1")
+else()
+  message(FATAL_ERROR "No benchmark TLS group selected")
+endif()
+
+target_sources(app PRIVATE src/main.c)
+target_include_directories(app PRIVATE ${BENCH_GENERATED_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(app PRIVATE
+  APP_TLS_GROUP_ID=${BENCH_TLS_GROUP_ID}
+  APP_TLS_GROUP_NAME="${BENCH_TLS_GROUP}"
+)

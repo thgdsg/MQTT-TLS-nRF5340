@@ -1,0 +1,26 @@
+services:
+  ipsp-benchmark:
+    build:
+      context: ..
+      dockerfile: benchmarking/docker/Dockerfile.benchmark
+    image: ipsp-mqtt-tls-wolf-benchmark:latest
+    network_mode: host
+    privileged: true
+    stdin_open: true
+    tty: true
+    working_dir: /workspace/ipsp_mqtt_tls_wolf
+    environment:
+      ROOT_DIR: /workspace/ipsp_mqtt_tls_wolf
+      OQS_PREFIX: /opt/oqs
+      OPENSSL_CONF: /workspace/ipsp_mqtt_tls_wolf/benchmarking/work/openssl-benchmark.cnf
+      OPENSSL_MODULES: /opt/oqs/lib/ossl-modules
+      LD_LIBRARY_PATH: /opt/oqs/lib
+      MQTT_PORT: "8883"
+    volumes:
+      - ..:/workspace/ipsp_mqtt_tls_wolf
+      - /var/run/dbus:/var/run/dbus
+      - /run/dbus:/run/dbus
+      - /sys/kernel/debug:/sys/kernel/debug
+      - /lib/modules:/lib/modules:ro
+      - /dev:/dev
+    command: help
