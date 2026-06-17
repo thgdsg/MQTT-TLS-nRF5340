@@ -9,12 +9,13 @@ fi
 
 BLE_ADDR="$1"
 # Linux bluetooth_6lowpan expects the LE address type as a number.
-# For the nRF5340 advertising as a random address, type 2 is the usual value.
+# For Nordic DKs advertising with a random BLE address, type 2 is the usual value.
 ADDR_TYPE="${2:-2}"
 DEBUGFS="/sys/kernel/debug"
 BT_DEBUG="${DEBUGFS}/bluetooth"
 LOWPAN_ENABLE="${BT_DEBUG}/6lowpan_enable"
 LOWPAN_CONTROL="${BT_DEBUG}/6lowpan_control"
+IPSP_SCAN_SECONDS="${IPSP_SCAN_SECONDS:-8}"
 
 if [ "$(id -u)" -ne 0 ]; then
     printf 'This script must run as root. Use: sudo %s ...\n' "$0"
@@ -44,6 +45,16 @@ fi
 
 printf 'Enabling Bluetooth 6LoWPAN...\n'
 printf '1\n' > "${LOWPAN_ENABLE}"
+
+# BlueZ may not have the board in its cache after a firmware flash or board
+# reset. Do a short LE scan so the kernel/BlueZ side has the active random
+# address and IPSP UUID before bluetooth_6lowpan tries to create bt0.
+if ! bluetoothctl info "${BLE_ADDR}" >/dev/null 2>&1; then
+    printf 'Scanning LE for %ss so BlueZ can discover %s...\n' \
+        "${IPSP_SCAN_SECONDS}" "${BLE_ADDR}"
+    timeout "${IPSP_SCAN_SECONDS}s" bluetoothctl scan le >/dev/null 2>&1 || true
+    bluetoothctl scan off >/dev/null 2>&1 || true
+fi
 
 # A failed TLS/IPSP run can leave bt0 around with stale IPv6/TCP state. Bring
 # it down before asking bluetooth_6lowpan to create a fresh peer link.

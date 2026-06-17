@@ -1,5 +1,5 @@
 /*
- * nRF5340 IPSP MQTT/TLS benchmark client.
+ * nRF52840 IPSP MQTT/TLS benchmark client.
  *
  * This application is isolated under benchmarking/ and does not replace the
  * main project firmware. It repeatedly connects to the broker, measures the
@@ -17,6 +17,7 @@
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/posix/fcntl.h>
+#include <zephyr/sys/sys_heap.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 
@@ -33,14 +34,14 @@
 #define MQTT_TLS_IO_TIMEOUT_MS 20000
 #define MQTT_KEEPALIVE_SEC 10
 #define BLE_IPSP_WRITE_CHUNK 64
-#define BLE_IPSP_WRITE_PAUSE_MS 20
+#define BLE_IPSP_WRITE_PAUSE_MS 0
 
 #ifndef APP_TLS_GROUP_ID
-#define APP_TLS_GROUP_ID WOLFSSL_ML_KEM_768
+#define APP_TLS_GROUP_ID WOLFSSL_ML_KEM_512
 #endif
 
 #ifndef APP_TLS_GROUP_NAME
-#define APP_TLS_GROUP_NAME "MLKEM768"
+#define APP_TLS_GROUP_NAME "MLKEM512"
 #endif
 
 struct socket_context {
@@ -63,6 +64,137 @@ static struct socket_context sock_ctx = {
 	.fd = -1,
 };
 static int last_tcp_connect_ms;
+
+struct wolfssl_alloc_header {
+	size_t size;
+	uint32_t magic;
+};
+
+#define WOLFSSL_ALLOC_MAGIC 0x5746534cu
+
+static size_t wolfssl_allocated;
+static size_t wolfssl_max_allocated;
+static size_t wolfssl_alloc_failures;
+
+void *XMALLOC(size_t n, void *heap, int type)
+{
+	struct wolfssl_alloc_header *hdr;
+	size_t total;
+
+	ARG_UNUSED(heap);
+
+	if (n == 0) {
+		n = 1;
+	}
+
+	total = sizeof(*hdr) + n;
+	hdr = k_malloc(total);
+	if (!hdr) {
+		wolfssl_alloc_failures++;
+		printk("wolfSSL XMALLOC failed: size=%zu type=%d current=%zu max=%zu failures=%zu\n",
+		       n, type, wolfssl_allocated, wolfssl_max_allocated,
+		       wolfssl_alloc_failures);
+		return NULL;
+	}
+
+	hdr->size = n;
+	hdr->magic = WOLFSSL_ALLOC_MAGIC;
+	wolfssl_allocated += n;
+	if (wolfssl_allocated > wolfssl_max_allocated) {
+		wolfssl_max_allocated = wolfssl_allocated;
+	}
+
+	return hdr + 1;
+}
+
+void XFREE(void *p, void *heap, int type)
+{
+	struct wolfssl_alloc_header *hdr;
+
+	ARG_UNUSED(heap);
+	ARG_UNUSED(type);
+
+	if (!p) {
+		return;
+	}
+
+	hdr = ((struct wolfssl_alloc_header *)p) - 1;
+	if (hdr->magic == WOLFSSL_ALLOC_MAGIC) {
+		wolfssl_allocated -= hdr->size;
+		hdr->magic = 0;
+		k_free(hdr);
+	}
+}
+
+void *XREALLOC(void *p, size_t n, void *heap, int type)
+{
+	struct wolfssl_alloc_header *hdr;
+	void *new_ptr;
+	size_t old_size = 0;
+
+	ARG_UNUSED(heap);
+
+	if (!p) {
+		return XMALLOC(n, heap, type);
+	}
+
+	if (n == 0) {
+		XFREE(p, heap, type);
+		return NULL;
+	}
+
+	hdr = ((struct wolfssl_alloc_header *)p) - 1;
+	if (hdr->magic == WOLFSSL_ALLOC_MAGIC) {
+		old_size = hdr->size;
+	}
+
+	new_ptr = XMALLOC(n, heap, type);
+	if (!new_ptr) {
+		return NULL;
+	}
+
+	memcpy(new_ptr, p, MIN(old_size, n));
+	XFREE(p, heap, type);
+
+	return new_ptr;
+}
+
+static void print_wolfssl_mem(const char *tag)
+{
+	printk("wolfssl_mem[%s]: current=%zu max=%zu failures=%zu\n",
+	       tag, wolfssl_allocated, wolfssl_max_allocated,
+	       wolfssl_alloc_failures);
+}
+
+#if defined(CONFIG_SYS_HEAP_RUNTIME_STATS)
+extern struct k_heap _system_heap;
+
+static void print_heap_stats(const char *tag)
+{
+	struct sys_memory_stats stats;
+	int rc;
+
+	rc = sys_heap_runtime_stats_get(&_system_heap.heap, &stats);
+	if (rc == 0) {
+		printk("heap[%s]: free=%zu allocated=%zu max_allocated=%zu\n",
+		       tag, stats.free_bytes, stats.allocated_bytes,
+		       stats.max_allocated_bytes);
+	} else {
+		printk("heap[%s]: stats unavailable rc=%d\n", tag, rc);
+	}
+}
+#else
+static void print_heap_stats(const char *tag)
+{
+	ARG_UNUSED(tag);
+}
+#endif
+
+static void print_memory_stats(const char *tag)
+{
+	print_heap_stats(tag);
+	print_wolfssl_mem(tag);
+}
 
 static int set_socket_timeout(int fd, int optname, int timeout_ms)
 {
@@ -274,9 +406,12 @@ static int tls_setup_cb(MqttClient *client)
 	};
 	int rc;
 
+	print_memory_stats("tls_setup_start");
+
 	client->tls.ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
 	if (!client->tls.ctx) {
 		printk("wolfSSL_CTX_new failed\n");
+		print_memory_stats("ctx_new_failed");
 		return WOLFSSL_FAILURE;
 	}
 
@@ -289,14 +424,23 @@ static int tls_setup_cb(MqttClient *client)
 					    WOLFSSL_FILETYPE_PEM);
 	if (rc != WOLFSSL_SUCCESS) {
 		printk("wolfSSL_CTX_load_verify_buffer failed: %d\n", rc);
+		print_memory_stats("load_ca_failed");
+		wolfSSL_CTX_free(client->tls.ctx);
+		client->tls.ctx = NULL;
 		return WOLFSSL_FAILURE;
 	}
 
 	rc = wolfSSL_CTX_set_groups(client->tls.ctx, groups, ARRAY_SIZE(groups));
 	if (rc != WOLFSSL_SUCCESS) {
 		printk("wolfSSL_CTX_set_groups failed: %d\n", rc);
+		print_memory_stats("set_groups_failed");
+		wolfSSL_CTX_free(client->tls.ctx);
+		client->tls.ctx = NULL;
 		return WOLFSSL_FAILURE;
 	}
+
+	printk("TLS 1.3 key exchange group: %s\n", APP_TLS_GROUP_NAME);
+	print_memory_stats("tls_setup_done");
 
 	return WOLFSSL_SUCCESS;
 }
@@ -339,6 +483,7 @@ static int mqtt_tls_net_connect(struct bench_metrics *metrics)
 			       rc, mqtt_client.tls.lastError,
 			       mqtt_client.tls.sockRcRead,
 			       mqtt_client.tls.sockRcWrite);
+			print_memory_stats("tls_connect_failed");
 			metrics->error_code = rc;
 			(void)MqttClient_NetDisconnect(&mqtt_client);
 			return rc;
@@ -348,6 +493,7 @@ static int mqtt_tls_net_connect(struct bench_metrics *metrics)
 	} while (k_uptime_get() < deadline);
 
 	metrics->error_code = MQTT_CODE_ERROR_TIMEOUT;
+	print_memory_stats("tls_connect_timeout");
 	(void)MqttClient_NetDisconnect(&mqtt_client);
 	return MQTT_CODE_ERROR_TIMEOUT;
 }
@@ -371,6 +517,8 @@ static int mqtt_connect_subscribe_publish(struct bench_metrics *metrics)
 
 	rc = MqttClient_Connect(&mqtt_client, &connect);
 	if (rc != MQTT_CODE_SUCCESS) {
+		printk("MqttClient_Connect failed: %d ack=%u\n",
+		       rc, connect.ack.return_code);
 		metrics->error_code = rc;
 		return rc;
 	}
@@ -386,6 +534,7 @@ static int mqtt_connect_subscribe_publish(struct bench_metrics *metrics)
 
 	rc = MqttClient_Subscribe(&mqtt_client, &subscribe);
 	if (rc != MQTT_CODE_SUCCESS) {
+		printk("MqttClient_Subscribe failed: %d\n", rc);
 		metrics->error_code = rc;
 		return rc;
 	}
@@ -400,6 +549,7 @@ static int mqtt_connect_subscribe_publish(struct bench_metrics *metrics)
 
 	rc = MqttClient_Publish(&mqtt_client, &publish);
 	if (rc != MQTT_CODE_SUCCESS) {
+		printk("MqttClient_Publish failed: %d\n", rc);
 		metrics->error_code = rc;
 		return rc;
 	}
@@ -436,6 +586,7 @@ static int run_one_attempt(struct bench_metrics *metrics)
 	}
 	(void)MqttClient_NetDisconnect(&mqtt_client);
 	MqttClient_DeInit(&mqtt_client);
+	print_memory_stats(rc == MQTT_CODE_SUCCESS ? "attempt_done" : "attempt_failed");
 	return rc;
 }
 
@@ -523,6 +674,7 @@ int main(void)
 	printk("Board IPv6: %s\n", CONFIG_NET_CONFIG_MY_IPV6_ADDR);
 	printk("Broker: [%s]:%d\n", CONFIG_APP_MQTT_BROKER_HOST,
 	       CONFIG_APP_MQTT_BROKER_PORT);
+	print_memory_stats("boot");
 
 	rc = net_config_init_app(NULL, "Initializing IPSP benchmark network");
 	printk("net_config_init_app returned: %d\n", rc);

@@ -7,17 +7,19 @@ WOLFMQTT_DIR="${ROOT_DIR}/modules/wolfmqtt"
 BUILD_DIR="${ROOT_DIR}/host/build"
 PQC="${PQC:-on}"
 KEYLOG="${KEYLOG:-off}"
+PQC_GROUP="${PQC_GROUP:-MLKEM512}"
 OUT="${BUILD_DIR}/wolfmqtt-broker"
 BROKER_MLKEM_PATCH="${ROOT_DIR}/patches/wolfmqtt-broker-force-mlkem-group.patch"
 
 usage()
 {
     cat <<EOF
-Usage: $(basename "$0") [--pqc on|off] [--keylog on|off]
+Usage: $(basename "$0") [--pqc on|off] [--pqc-group MLKEM512|MLKEM768|MLKEM1024] [--keylog on|off]
 
 Options:
-  --pqc on    build broker with TLS 1.3 standalone MLKEM768 key exchange
+  --pqc on    build broker with TLS 1.3 standalone ML-KEM key exchange
   --pqc off   build broker with classic TLS 1.3 key exchange
+  --pqc-group select the standalone ML-KEM TLS 1.3 group. Default: MLKEM512
   --keylog on enable TLS keylog callback for pcap decryption
   --keylog off disable TLS keylog callback. Default
 EOF
@@ -47,6 +49,18 @@ while [ "$#" -gt 0 ]; do
         ;;
     --keylog=*)
         KEYLOG="${1#--keylog=}"
+        shift
+        ;;
+    --pqc-group)
+        if [ "$#" -lt 2 ]; then
+            printf 'Missing value for --pqc-group. Use: MLKEM512, MLKEM768, or MLKEM1024\n' >&2
+            exit 1
+        fi
+        PQC_GROUP="${2:-}"
+        shift 2
+        ;;
+    --pqc-group=*)
+        PQC_GROUP="${1#--pqc-group=}"
         shift
         ;;
     -h | --help)
@@ -81,10 +95,27 @@ on | off)
     ;;
 esac
 
+case "${PQC_GROUP}" in
+MLKEM512)
+    PQC_GROUP_MACRO="WOLFSSL_ML_KEM_512"
+    ;;
+MLKEM768)
+    PQC_GROUP_MACRO="WOLFSSL_ML_KEM_768"
+    ;;
+MLKEM1024)
+    PQC_GROUP_MACRO="WOLFSSL_ML_KEM_1024"
+    ;;
+*)
+    printf 'Invalid --pqc-group value: %s\n' "${PQC_GROUP}" >&2
+    printf 'Use: MLKEM512, MLKEM768, or MLKEM1024\n' >&2
+    exit 1
+    ;;
+esac
+
 if [ "${PQC}" = "on" ] && [ "${KEYLOG}" = "on" ]; then
-    WOLFSSL_PREFIX="${BUILD_DIR}/wolfssl-mlkem768-keylog-install"
+    WOLFSSL_PREFIX="${BUILD_DIR}/wolfssl-${PQC_GROUP,,}-keylog-install"
 elif [ "${PQC}" = "on" ]; then
-    WOLFSSL_PREFIX="${BUILD_DIR}/wolfssl-mlkem768-nokeylog-install"
+    WOLFSSL_PREFIX="${BUILD_DIR}/wolfssl-${PQC_GROUP,,}-nokeylog-install"
 else
     WOLFSSL_PREFIX="${BUILD_DIR}/wolfssl-off-install"
 fi
@@ -111,7 +142,7 @@ fi
 mkdir -p "${BUILD_DIR}" "${ROOT_DIR}/host/wolfmqtt"
 
 if [ ! -f "${WOLFSSL_PREFIX}/lib/libwolfssl.a" ]; then
-    printf 'Building local wolfSSL for host (PQC=%s)...\n' "${PQC}"
+    printf 'Building local wolfSSL for host (PQC=%s, GROUP=%s)...\n' "${PQC}" "${PQC_GROUP}"
 
     if [ ! -x "${WOLFSSL_DIR}/configure" ]; then
         (cd "${WOLFSSL_DIR}" && ./autogen.sh)
@@ -158,9 +189,10 @@ cat > "${ROOT_DIR}/host/wolfmqtt/options.h" <<'EOF'
 EOF
 
 if [ "${PQC}" = "on" ]; then
-    cat >> "${ROOT_DIR}/host/wolfmqtt/options.h" <<'EOF'
+    cat >> "${ROOT_DIR}/host/wolfmqtt/options.h" <<EOF
 #define WOLFMQTT_BROKER_FORCE_MLKEM_GROUP
-#define WOLFMQTT_BROKER_MLKEM_GROUP WOLFSSL_ML_KEM_768
+#define WOLFMQTT_BROKER_MLKEM_GROUP ${PQC_GROUP_MACRO}
+#define WOLFMQTT_BROKER_MLKEM_GROUP_NAME "${PQC_GROUP}"
 #define WOLFMQTT_BROKER_TLS_GROUPS WOLFMQTT_BROKER_MLKEM_GROUP
 #define WOLFMQTT_BROKER_TLS_HANDSHAKE_TIMEOUT_S 30
 EOF
@@ -188,4 +220,4 @@ cc -O2 -Wall -Wextra \
     "${WOLFSSL_PREFIX}/lib/libwolfssl.a" \
     -lm -lpthread
 
-printf 'Built %s (PQC=%s, KEYLOG=%s)\n' "${OUT}" "${PQC}" "${KEYLOG}"
+printf 'Built %s (PQC=%s, GROUP=%s, KEYLOG=%s)\n' "${OUT}" "${PQC}" "${PQC_GROUP}" "${KEYLOG}"

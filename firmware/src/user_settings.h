@@ -4,11 +4,17 @@
 #include <zephyr/net/socket.h>
 
 #define WOLFSSL_TLS13
+#define WOLFSSL_NO_TLS12
+#define NO_OLD_TLS
+#define SINGLE_THREADED
 #define HAVE_TLS_EXTENSIONS
 #define HAVE_SUPPORTED_CURVES
 #define HAVE_ECC
-#define HAVE_FFDHE_2048
-#define WC_RSA_PSS
+#define NO_DH
+#define NO_RSA
+#define NO_DSA
+#define NO_PSK
+#define NO_WOLFSSL_SERVER
 #define HAVE_AESGCM
 #define HAVE_HKDF
 #define HAVE_HASHDRBG
@@ -19,8 +25,10 @@
 #define HAVE_SERVER_INDICATION
 #define WOLFSSL_SMALL_STACK
 #define WOLFSSL_DH_CONST
+#define NO_SESSION_CACHE
 #define WOLFSSL_NO_SOCK
 #define WOLFSSL_USER_IO
+#define XMALLOC_USER
 #define NO_INT128
 #define NO_ASN_TIME_CHECK
 

@@ -4,13 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Runtime defaults. Override any of these as environment variables.
-TTY_DEVICE="${TTY_DEVICE:-/dev/ttyACM1}"
+TTY_DEVICE="${TTY_DEVICE:-/dev/ttyACM0}"
 BAUDRATE="${BAUDRATE:-115200}"
 MQTT_HOST="${MQTT_HOST:-127.0.0.1}"
 MQTT_PORT="${MQTT_PORT:-8883}"
 MQTT_CAFILE="${MQTT_CAFILE:-${ROOT_DIR}/host/certs/ca.crt}"
-MQTT_COMMAND_TOPIC="${MQTT_COMMAND_TOPIC:-nrf5340/command}"
-MQTT_TELEMETRY_TOPIC="${MQTT_TELEMETRY_TOPIC:-nrf5340/telemetry}"
+MQTT_COMMAND_TOPIC="${MQTT_COMMAND_TOPIC:-nrf52840/command}"
+MQTT_TELEMETRY_TOPIC="${MQTT_TELEMETRY_TOPIC:-nrf52840/telemetry}"
 MQTT_INSECURE="${MQTT_INSECURE:-1}"
 MQTT_TLS_VERSION="${MQTT_TLS_VERSION:-tlsv1.3}"
 SHOW_TELEMETRY="${SHOW_TELEMETRY:-1}"
@@ -22,14 +22,17 @@ PONG_CAPTURE_LOG="${PONG_CAPTURE_LOG:-${ROOT_DIR}/scripts/pong_tcpdump.log}"
 PONG_LOG_MODE="${PONG_LOG_MODE:-tls_capture}"
 PONG_KEY_FILE="${PONG_KEY_FILE:-${ROOT_DIR}/scripts/pong.key}"
 BROKER_STOP_TIMEOUT_SEC="${BROKER_STOP_TIMEOUT_SEC:-1}"
-IPSP_ADDR="${IPSP_ADDR:-F8:69:5E:1E:CE:2F}"
+IPSP_ADDR="${IPSP_ADDR:-F9:79:AE:2A:9A:1E}"
 IPSP_ADDR_TYPE="${IPSP_ADDR_TYPE:-2}"
 NRFUTIL="${NRFUTIL:-/home/thiago/.local/bin/nrfutil}"
-SERIAL_NUMBER="${SERIAL_NUMBER:-1050032722}"
+SERIAL_NUMBER="${SERIAL_NUMBER:-auto}"
+NRF_FAMILY="${NRF_FAMILY:-nrf52}"
 NCS_VERSION="${NCS_VERSION:-v2.6.0}"
 NCS_CHDIR="${NCS_CHDIR:-/home/thiago/ncs/v2.6.0/nrf}"
-BOARD="${BOARD:-nrf5340dk_nrf5340_cpuapp}"
+BOARD="${BOARD:-nrf52840dk_nrf52840}"
+SYSBUILD="${SYSBUILD:-0}"
 PQC="${PQC:-on}"
+PQC_GROUP="${PQC_GROUP:-MLKEM512}"
 BROKER_KEYLOG="${BROKER_KEYLOG:-off}"
 OQS_PREFIX="${OQS_PREFIX:-/home/thiago/Documents/canada/pesquisa/oqs-openssl/install}"
 OPENSSL_OQS_CONF="${OPENSSL_OQS_CONF:-${ROOT_DIR}/host/openssl-oqs.cnf}"
@@ -82,19 +85,22 @@ Environment overrides:
   IPSP_ADDR_TYPE=${IPSP_ADDR_TYPE}
   NRFUTIL=${NRFUTIL}
   SERIAL_NUMBER=${SERIAL_NUMBER}
+  NRF_FAMILY=${NRF_FAMILY}
   NCS_VERSION=${NCS_VERSION}
   NCS_CHDIR=${NCS_CHDIR}
   BOARD=${BOARD}
+  SYSBUILD=${SYSBUILD}
   PQC=${PQC}
+  PQC_GROUP=${PQC_GROUP}
   BROKER_KEYLOG=${BROKER_KEYLOG}
   OQS_PREFIX=${OQS_PREFIX}
   OPENSSL_OQS_CONF=${OPENSSL_OQS_CONF}
 
 Interactive commands:
-  build broker [--pqc on|off] [--keylog on|off]
-           build host/build/wolfmqtt-broker. Default PQC=${PQC}, KEYLOG=${BROKER_KEYLOG}
+  build broker [--pqc on|off] [--pqc-group MLKEM512|MLKEM768|MLKEM1024] [--keylog on|off]
+           build host/build/wolfmqtt-broker. Default PQC=${PQC}, GROUP=${PQC_GROUP}, KEYLOG=${BROKER_KEYLOG}
   build firmware [--pqc on|off]
-           build firmware/build/merged.hex and merged_CPUNET.hex. Default PQC=${PQC}
+           build firmware/build/zephyr/zephyr.hex. Default PQC=${PQC}
   connect [mac] [random|public|1|2]
            run host/ipsp_connect.sh. Defaults: ${IPSP_ADDR} ${IPSP_ADDR_TYPE}
   broker on|off|restart|status
@@ -135,7 +141,9 @@ docker_env_args()
 		-e "IPSP_ADDR=${IPSP_ADDR}" \
 		-e "IPSP_ADDR_TYPE=${IPSP_ADDR_TYPE}" \
 		-e "SERIAL_NUMBER=${SERIAL_NUMBER}" \
+		-e "NRF_FAMILY=${NRF_FAMILY}" \
 		-e "PQC=${PQC}" \
+		-e "PQC_GROUP=${PQC_GROUP}" \
 		-e "BROKER_KEYLOG=${BROKER_KEYLOG}"
 }
 
@@ -171,6 +179,7 @@ run_build_broker()
 	local build_script="${ROOT_DIR}/host/build_wolf_broker.sh"
 	local pqc
 	local keylog
+	local pqc_group="${PQC_GROUP}"
 
 	if [ ! -x "${build_script}" ]; then
 		printf '[build] broker build script not found or not executable: %s\n' "${build_script}" >&2
@@ -179,15 +188,35 @@ run_build_broker()
 
 	pqc="$(parse_pqc_option "$@")" || return 1
 	keylog="$(parse_keylog_option "$@")" || return 1
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+		--pqc-group)
+			if [ "$#" -lt 2 ]; then
+				printf '[build] missing value for --pqc-group\n' >&2
+				return 1
+			fi
+			pqc_group="$2"
+			shift 2
+			;;
+		--pqc-group=*)
+			pqc_group="${1#--pqc-group=}"
+			shift
+			;;
+		*)
+			shift
+			;;
+		esac
+	done
 
-	printf '[build] building broker PQC=%s KEYLOG=%s\n' "${pqc}" "${keylog}"
-	"${build_script}" --pqc "${pqc}" --keylog "${keylog}"
+	printf '[build] building broker PQC=%s GROUP=%s KEYLOG=%s\n' "${pqc}" "${pqc_group}" "${keylog}"
+	"${build_script}" --pqc "${pqc}" --pqc-group "${pqc_group}" --keylog "${keylog}"
 }
 
 run_build_firmware()
 {
 	local pqc
 	local cmake_args=()
+	local build_args=()
 
 	if [ ! -x "${NRFUTIL}" ]; then
 		printf '[build] nrfutil not found at %s\n' "${NRFUTIL}" >&2
@@ -202,15 +231,20 @@ run_build_firmware()
 	fi
 
 	printf '[build] building firmware with NCS %s board %s PQC=%s\n' "${NCS_VERSION}" "${BOARD}" "${pqc}"
+	build_args=(
+		-d "${ROOT_DIR}/firmware/build"
+		-b "${BOARD}"
+		-p always
+		"${ROOT_DIR}/firmware"
+	)
+	if [ "${SYSBUILD}" = "1" ]; then
+		build_args=(--sysbuild "${build_args[@]}")
+	fi
 	env SHELL=/bin/bash "${NRFUTIL}" sdk-manager toolchain launch \
 		--ncs-version "${NCS_VERSION}" \
 		--chdir "${NCS_CHDIR}" \
 		-- west build \
-		-d "${ROOT_DIR}/firmware/build" \
-		-b "${BOARD}" \
-		--sysbuild \
-		-p always \
-		"${ROOT_DIR}/firmware" \
+		"${build_args[@]}" \
 		-- "${cmake_args[@]}"
 }
 
@@ -242,9 +276,19 @@ parse_pqc_option()
 		--keylog=*)
 			shift
 			;;
+		--pqc-group)
+			if [ "$#" -lt 2 ]; then
+				printf 'Missing value for --pqc-group.\n' >&2
+				return 1
+			fi
+			shift 2
+			;;
+		--pqc-group=*)
+			shift
+			;;
 		*)
 			printf 'Unknown build option: %s\n' "$1" >&2
-			printf 'Use: --pqc on or --pqc off.\n' >&2
+			printf 'Use: --pqc on|off, --pqc-group MLKEM512|MLKEM768|MLKEM1024, or --keylog on|off.\n' >&2
 			return 1
 			;;
 		esac
@@ -290,9 +334,19 @@ parse_keylog_option()
 		--pqc=*)
 			shift
 			;;
+		--pqc-group)
+			if [ "$#" -lt 2 ]; then
+				printf 'Missing value for --pqc-group.\n' >&2
+				return 1
+			fi
+			shift 2
+			;;
+		--pqc-group=*)
+			shift
+			;;
 		*)
 			printf 'Unknown build option: %s\n' "$1" >&2
-			printf 'Use: --keylog on or --keylog off.\n' >&2
+			printf 'Use: --pqc on|off, --pqc-group MLKEM512|MLKEM768|MLKEM1024, or --keylog on|off.\n' >&2
 			return 1
 			;;
 		esac
@@ -343,7 +397,8 @@ mqtt_args()
 
 mqtt_env_args()
 {
-	# In PQC mode, force Mosquitto/OpenSSL through the OQS provider and MLKEM768.
+	# In PQC mode, force Mosquitto/OpenSSL through the OQS provider and the
+	# same ML-KEM group used by the wolfMQTT broker/firmware.
 	if [ "${PQC}" != "on" ]; then
 		return
 	fi
@@ -385,8 +440,8 @@ check_oqs_runtime()
 
 	mapfile -t env_args < <(mqtt_env_args)
 	tls_groups="$(env "${env_args[@]}" openssl list -tls1_3 -tls-groups 2>/dev/null || true)"
-	if ! printf '%s\n' "${tls_groups}" | grep -qi 'MLKEM768'; then
-		printf '[mqtt] OpenSSL/OQS is loaded, but MLKEM768 is not available as a TLS 1.3 group.\n' >&2
+	if ! printf '%s\n' "${tls_groups}" | grep -qi "${PQC_GROUP}"; then
+		printf '[mqtt] OpenSSL/OQS is loaded, but %s is not available as a TLS 1.3 group.\n' "${PQC_GROUP}" >&2
 		printf '[mqtt] Rebuild the Docker server image or fix your local OpenSSL/OQS provider before publishing.\n' >&2
 		return 1
 	fi
@@ -620,6 +675,13 @@ run_ipsp_connect()
 		esac
 	fi
 
+	if [ -z "${addr}" ]; then
+		printf 'No IPSP BLE address configured.\n' >&2
+		printf 'Use: connect <BLE_MAC> [random|public|1|2]\n' >&2
+		printf 'Or start with: IPSP_ADDR=<BLE_MAC> %s\n' "$0" >&2
+		return 1
+	fi
+
 	type_num="$(addr_type_to_number "${type}")"
 
 	if [ ! -x "${connect_script}" ]; then
@@ -653,7 +715,12 @@ nrf_device_connected()
 		return 1
 	fi
 
-	if printf '%s\n' "${devices}" | grep -q "^${SERIAL_NUMBER}$"; then
+	if [ "${SERIAL_NUMBER}" = "auto" ] &&
+	   [ "$(printf '%s\n' "${devices}" | sed -n 's/^\([0-9][0-9]*\)$/\1/p' | wc -l)" -eq 1 ]; then
+		return 0
+	fi
+
+	if [ "${SERIAL_NUMBER}" != "auto" ] && printf '%s\n' "${devices}" | grep -q "^${SERIAL_NUMBER}$"; then
 		return 0
 	fi
 
@@ -688,7 +755,7 @@ run_flash()
 	stop_serial_monitor
 
 	printf '[flash] flashing nRF device %s\n' "${SERIAL_NUMBER}"
-	if NRFUTIL="${NRFUTIL}" SERIAL_NUMBER="${SERIAL_NUMBER}" "${flash_script}" "$@"; then
+	if NRFUTIL="${NRFUTIL}" SERIAL_NUMBER="${SERIAL_NUMBER}" NRF_FAMILY="${NRF_FAMILY}" "${flash_script}" "$@"; then
 		printf '[flash] done\n'
 	else
 		printf '[flash] failed\n' >&2
@@ -980,9 +1047,11 @@ print_status()
 [status] default IPSP peer: ${IPSP_ADDR} addr_type=${IPSP_ADDR_TYPE}
 [status] nrfutil: ${NRFUTIL}
 [status] nRF serial number: ${SERIAL_NUMBER}
+[status] nRF family: ${NRF_FAMILY}
 [status] NCS version: ${NCS_VERSION}
 [status] NCS chdir: ${NCS_CHDIR}
 [status] board: ${BOARD}
+[status] sysbuild: ${SYSBUILD}
 [status] default PQC build mode: ${PQC}
 [status] broker keylog build mode: ${BROKER_KEYLOG}
 [status] OQS prefix: ${OQS_PREFIX}

@@ -65,7 +65,7 @@
 +        }
 +        else {
 +            WBLOG_INFO(broker,
-+                "broker: TLS 1.3 group MLKEM768");
++                "broker: TLS 1.3 group " WOLFMQTT_BROKER_MLKEM_GROUP_NAME);
 +        }
 +    }
 +#endif

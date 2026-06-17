@@ -24,6 +24,7 @@
 #define WOLFSSL_DH_CONST
 #define WOLFSSL_NO_SOCK
 #define WOLFSSL_USER_IO
+#define XMALLOC_USER
 #define NO_INT128
 #define NO_ASN_TIME_CHECK
 

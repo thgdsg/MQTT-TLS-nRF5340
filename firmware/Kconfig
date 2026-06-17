@@ -12,14 +12,14 @@ config APP_MQTT_BROKER_PORT
 
 config APP_MQTT_CLIENT_ID
 	string "MQTT client ID"
-	default "nrf5340-ipsp-wolfmqtt"
+	default "nrf52840-ipsp-wolfmqtt"
 
 config APP_MQTT_TELEMETRY_TOPIC
 	string "MQTT telemetry topic"
-	default "nrf5340/telemetry"
+	default "nrf52840/telemetry"
 
 config APP_MQTT_COMMAND_TOPIC
 	string "MQTT command topic"
-	default "nrf5340/command"
+	default "nrf52840/command"
 
 endmenu

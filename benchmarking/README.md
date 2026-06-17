@@ -72,7 +72,7 @@ python benchmarking/run_benchmarks.py \
 
 ## Hardware Run
 
-Power the nRF5340 DK, make sure `nrfutil device list` sees the board, and keep
+Power the nRF52840 DK, make sure `nrfutil device list` sees the board, and keep
 the IPSP prerequisites from the main project working.
 
 Then run a short smoke test:
@@ -95,6 +95,14 @@ The runner will:
 6. Start the benchmark broker in Docker.
 7. Parse serial `BENCH_ATTEMPT` lines and write CSV output.
 
+The default benchmark target is now `nrf52840dk_nrf52840`, using nRF52
+single-core flashing through `nrfutil`. To run the same benchmark on the older
+nRF5340 DK setup, pass:
+
+```bash
+--board nrf5340dk_nrf5340_cpuapp --nrf-family nrf53 --sysbuild --serial-device /dev/ttyACM1
+```
+
 Run `sudo -v` before the benchmark if your IPSP connect path requires sudo.
 For long runs, prefer a narrow passwordless sudo rule for the IPSP connect
 script so the benchmark never stops waiting for a password:
@@ -113,7 +121,7 @@ Then validate it:
 
 ```bash
 sudo chmod 0440 /etc/sudoers.d/ipsp-benchmark
-sudo -n /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/host/ipsp_connect.sh F8:69:5E:1E:CE:2F 2
+sudo -n /home/thiago/Documents/canada/pesquisa/ipsp_mqtt_tls_wolf/host/ipsp_connect.sh F9:79:AE:2A:9A:1E 2
 ```
 
 After that, run benchmarks with `--sudo-noninteractive`:
@@ -131,6 +139,9 @@ Useful hardware-run options:
 - `--skip-flash`: do not program the board again; the runner only resets it.
   This requires cached cert artifacts for the same `case_id`, created by a
   previous run without `--skip-flash`.
+- `--reset-after-case` / `--no-reset-after-case`: reset the board after each
+  case by default, clearing firmware-side network/TLS state before the next
+  cryptographic combination.
 - `--connect-retries 5`: firmware connection tries per measured attempt.
 - `--connect-retry-delay-sec 5`: wait time between failed connection tries.
 - `--initial-delay-sec 45`: firmware wait before the first measured attempt,
@@ -145,6 +156,11 @@ Useful hardware-run options:
 - `--ipsp-ping-retries 3`: ping rounds before declaring IPSP unusable.
 - `--skip-ipsp-ping-check`: skip the host `ping -6 -I bt0 2001:db8::1`
   preflight. This is useful only when ICMP is blocked but TCP is known to work.
+
+The firmware also prints `heap[...]` and `wolfssl_mem[...]` lines around TLS
+setup, failures, and attempt cleanup. If a case stops after repeated retries,
+check whether `wolfssl_mem[attempt_failed]` returns to `current=0` and whether
+`failures` increased.
 
 ## Results
 

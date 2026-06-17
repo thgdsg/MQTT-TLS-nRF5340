@@ -8,6 +8,7 @@ import csv
 import os
 import random
 import queue
+import re
 import shutil
 import statistics
 import subprocess
@@ -202,6 +203,27 @@ def docker_run(args: list[str], log_path: Path, *, check: bool = True) -> subpro
 
 def docker_rm_force(name: str, log_path: Path) -> None:
     run_logged(["docker", "rm", "-f", name], log_path, check=False)
+
+
+def cleanup_host_ipsp_link(paths: CasePaths, args: argparse.Namespace) -> None:
+    if os.geteuid() != 0 and not args.sudo_noninteractive:
+        with paths.docker_log.open("a") as log:
+            log.write("[cleanup] skipping bt0 cleanup without --sudo-noninteractive\n")
+        return
+
+    cmd = [
+        "bash",
+        "-lc",
+        (
+            f"ip link show {args.ipsp_interface} >/dev/null 2>&1 || exit 0; "
+            f"ip link set {args.ipsp_interface} down 2>/dev/null || true; "
+            f"ip address flush dev {args.ipsp_interface} 2>/dev/null || true; "
+            f"ip -6 neigh flush dev {args.ipsp_interface} 2>/dev/null || true"
+        ),
+    ]
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n", *cmd]
+    run_logged(cmd, paths.docker_log, check=False)
 
 
 def cleanup_stale_benchmark_containers(log_path: Path) -> None:
@@ -413,7 +435,14 @@ def build_broker(case: dict[str, str], paths: CasePaths) -> Path:
     raise RuntimeError("Broker path was not reported by build_benchmark_broker.sh")
 
 
-def build_firmware(case: dict[str, str], paths: CasePaths, args: argparse.Namespace) -> Path:
+def build_firmware(
+    case: dict[str, str],
+    paths: CasePaths,
+    args: argparse.Namespace,
+    *,
+    iterations: int | None = None,
+    warmup_iterations: int | None = None,
+) -> Path:
     build_dir = WORK_DIR / "firmware-build" / case["case_id"]
     overlay = paths.generated / "bench_overlay.conf"
     default_generated = WORK_DIR / "generated" / "default"
@@ -440,8 +469,8 @@ def build_firmware(case: dict[str, str], paths: CasePaths, args: argparse.Namesp
     overlay.write_text(
         "\n".join(
             [
-                f"CONFIG_APP_BENCH_ITERATIONS={case['iterations']}",
-                f"CONFIG_APP_BENCH_WARMUP_ITERATIONS={case['warmup_iterations']}",
+                f"CONFIG_APP_BENCH_ITERATIONS={iterations if iterations is not None else case['iterations']}",
+                f"CONFIG_APP_BENCH_WARMUP_ITERATIONS={warmup_iterations if warmup_iterations is not None else case['warmup_iterations']}",
                 f"CONFIG_APP_BENCH_INITIAL_DELAY_MS={int(args.initial_delay_sec * 1000)}",
                 f"CONFIG_APP_BENCH_CONNECT_RETRIES={args.connect_retries}",
                 f"CONFIG_APP_BENCH_CONNECT_RETRY_DELAY_MS={int(args.connect_retry_delay_sec * 1000)}",
@@ -467,33 +496,62 @@ def build_firmware(case: dict[str, str], paths: CasePaths, args: argparse.Namesp
         str(build_dir),
         "-b",
         args.board,
-        "--sysbuild",
         "-p",
         "always",
         str(BENCH_ROOT / "firmware"),
         "--",
         f"-DEXTRA_CONF_FILE={overlay}",
     ]
+    if args.sysbuild:
+        cmd.insert(cmd.index("-p"), "--sysbuild")
     env = os.environ.copy()
     env["SHELL"] = "/bin/bash"
     run_logged(cmd, paths.build_log, env=env)
     return build_dir
 
 
+def resolve_serial_number(args: argparse.Namespace, log_path: Path) -> str:
+    if args.serial_number != "auto":
+        return args.serial_number
+
+    proc = run_logged([args.nrfutil, "device", "list"], log_path, check=False)
+    text = log_path.read_text(errors="ignore")
+    serials = sorted(set(re.findall(r"(?m)^([0-9]{6,})$", text)))
+    if proc.returncode != 0:
+        raise RuntimeError(f"nrfutil device list failed; see {log_path}")
+    if len(serials) != 1:
+        raise RuntimeError(
+            f"--serial-number auto expected exactly one connected nRF device, found {len(serials)}: {serials}"
+        )
+    return serials[0]
+
+
+def find_firmware_hex(build_dir: Path) -> Path:
+    candidates = [
+        build_dir / "merged.hex",
+        build_dir / "zephyr" / "merged.hex",
+        build_dir / "zephyr" / "zephyr.hex",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    searched = ", ".join(str(path.relative_to(build_dir)) for path in candidates)
+    raise FileNotFoundError(f"Expected firmware HEX not found in {build_dir}; searched: {searched}")
+
+
 def flash_firmware(build_dir: Path, paths: CasePaths, args: argparse.Namespace, *, reset: bool = True) -> None:
-    app_hex = build_dir / "merged.hex"
+    app_hex = find_firmware_hex(build_dir)
     net_hex = build_dir / "merged_CPUNET.hex"
-    if not app_hex.exists():
-        raise FileNotFoundError(f"Expected merged.hex not found in {build_dir}")
+    serial_number = resolve_serial_number(args, paths.flash_log)
 
     common = [
         args.nrfutil,
         "device",
         "program",
         "--serial-number",
-        args.serial_number,
+        serial_number,
         "--family",
-        "nrf53",
+        args.nrf_family,
         "--swd-clock-frequency",
         args.swd_clock_frequency,
     ]
@@ -541,7 +599,8 @@ def flash_firmware(build_dir: Path, paths: CasePaths, args: argparse.Namespace, 
 
 
 def reset_device(paths: CasePaths, args: argparse.Namespace) -> None:
-    run_logged([args.nrfutil, "device", "reset", "--serial-number", args.serial_number, "--family", "nrf53"], paths.flash_log)
+    serial_number = resolve_serial_number(args, paths.flash_log)
+    run_logged([args.nrfutil, "device", "reset", "--serial-number", serial_number, "--family", args.nrf_family], paths.flash_log)
 
 
 def connect_ipsp(paths: CasePaths, args: argparse.Namespace) -> None:
@@ -716,6 +775,116 @@ def stop_serial(proc: subprocess.Popen[str]) -> None:
         proc.wait(timeout=3)
     except subprocess.TimeoutExpired:
         proc.kill()
+
+
+def attempt_batches(warmups: int, iterations: int, limit: int) -> list[tuple[int, int]]:
+    total = warmups + iterations
+    if limit <= 0 or total <= limit:
+        return [(warmups, iterations)]
+
+    batches: list[tuple[int, int]] = []
+    consumed = 0
+    while consumed < total:
+        size = min(limit, total - consumed)
+        batch_warmups = max(0, min(warmups - consumed, size))
+        batch_iterations = size - batch_warmups
+        batches.append((batch_warmups, batch_iterations))
+        consumed += size
+    return batches
+
+
+def renumber_attempts(
+    attempts: list[dict[str, object]],
+    *,
+    start_index: int,
+    total_warmups: int,
+) -> list[dict[str, object]]:
+    renumbered: list[dict[str, object]] = []
+    for offset, attempt in enumerate(attempts, start=0):
+        global_index = start_index + offset
+        renumbered.append(
+            {
+                **attempt,
+                "attempt_index": global_index,
+                "warmup": 1 if global_index <= total_warmups else 0,
+            }
+        )
+    return renumbered
+
+
+def stop_broker(handle: BrokerHandle, paths: CasePaths) -> None:
+    docker_rm_force(handle.container_name, paths.docker_log)
+    handle.proc.terminate()
+    try:
+        handle.proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        handle.proc.kill()
+
+
+def cleanup_case_session(paths: CasePaths, args: argparse.Namespace) -> None:
+    cleanup_stale_benchmark_containers(paths.docker_log)
+    docker_run(["clean-port"], paths.docker_log, check=False)
+    cleanup_host_ipsp_link(paths, args)
+
+
+def run_case_session(
+    sequence: int,
+    session_count: int,
+    session_warmups: int,
+    session_iterations: int,
+    broker: Path,
+    paths: CasePaths,
+    case: dict[str, str],
+    args: argparse.Namespace,
+    *,
+    build_dir: Path | None,
+) -> list[dict[str, object]]:
+    expected_attempts = session_warmups + session_iterations
+    with paths.docker_log.open("a") as log:
+        log.write(
+            f"[session] {sequence}/{session_count} "
+            f"warmups={session_warmups} iterations={session_iterations}\n"
+        )
+
+    cleanup_case_session(paths, args)
+
+    broker_handle = start_broker(broker, paths, args)
+    serial_capture: SerialCapture | None = None
+    try:
+        wait_for_broker_ready(broker_handle, paths, args)
+        if args.skip_flash:
+            serial_capture = SerialCapture(start_serial(paths, args), paths)
+            serial_capture.start()
+            reset_device(paths, args)
+        else:
+            if build_dir is None:
+                raise RuntimeError("firmware build_dir is required when --skip-flash is not used")
+            flash_firmware(build_dir, paths, args, reset=False)
+            serial_capture = SerialCapture(start_serial(paths, args), paths)
+            serial_capture.start()
+            reset_device(paths, args)
+
+        if not serial_capture.wait_for_text("BENCH_START", args.board_boot_timeout_sec):
+            raise TimeoutError(
+                f"board did not print BENCH_START within {args.board_boot_timeout_sec}s; see {paths.board_log}"
+            )
+        ensure_ipsp_connected(paths, args)
+        if not serial_capture.wait_for_text("BENCH_READY", args.board_ready_timeout_sec):
+            raise TimeoutError(
+                f"board did not print BENCH_READY within {args.board_ready_timeout_sec}s after IPSP connect; "
+                f"see {paths.board_log}"
+            )
+        require_board_ping(paths, args)
+        return serial_capture.wait_for_attempts(expected_attempts, args.case_timeout_sec)
+    finally:
+        if serial_capture:
+            serial_capture.stop()
+        stop_broker(broker_handle, paths)
+        cleanup_case_session(paths, args)
+        if args.reset_after_case:
+            reset_device(paths, args)
+
+
 def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.Namespace) -> dict[str, object]:
     paths = case_paths(run_dir, sequence, case["case_id"])
     paths.root.mkdir(parents=True, exist_ok=False)
@@ -744,46 +913,48 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
         cache_case_artifacts(case, paths)
 
     broker = build_broker(case, paths)
-    if args.skip_flash:
-        build_dir = None
-    else:
-        build_dir = build_firmware(case, paths, args)
 
-    cleanup_stale_benchmark_containers(paths.docker_log)
-    docker_run(["clean-port"], paths.docker_log, check=False)
+    total_warmups = int(case["warmup_iterations"])
+    total_iterations = int(case["iterations"])
+    batches = attempt_batches(total_warmups, total_iterations, args.session_attempt_limit)
+    if args.skip_flash and len(batches) > 1:
+        raise ValueError(
+            "--skip-flash cannot be used with split benchmark sessions because the firmware attempt count "
+            "is compiled into the image. Re-run without --skip-flash or pass --session-attempt-limit 0."
+        )
 
-    broker_handle = start_broker(broker, paths, args)
-    serial_capture: SerialCapture | None = None
-    try:
-        wait_for_broker_ready(broker_handle, paths, args)
+    attempts: list[dict[str, object]] = []
+    next_attempt_index = 1
+    for session_index, (session_warmups, session_iterations) in enumerate(batches, start=1):
         if args.skip_flash:
-            serial_capture = SerialCapture(start_serial(paths, args), paths)
-            serial_capture.start()
-            reset_device(paths, args)
+            build_dir = None
         else:
-            flash_firmware(build_dir, paths, args, reset=False)
-            serial_capture = SerialCapture(start_serial(paths, args), paths)
-            serial_capture.start()
-            reset_device(paths, args)
-        if not serial_capture.wait_for_text("BENCH_START", args.board_boot_timeout_sec):
-            raise TimeoutError(f"board did not print BENCH_START within {args.board_boot_timeout_sec}s; see {paths.board_log}")
-        ensure_ipsp_connected(paths, args)
-        if not serial_capture.wait_for_text("BENCH_READY", args.board_ready_timeout_sec):
-            raise TimeoutError(f"board did not print BENCH_READY within {args.board_ready_timeout_sec}s after IPSP connect; see {paths.board_log}")
-        require_board_ping(paths, args)
-        expected_attempts = int(case["iterations"]) + int(case["warmup_iterations"])
-        attempts = serial_capture.wait_for_attempts(expected_attempts, args.case_timeout_sec)
-    finally:
-        if serial_capture:
-            serial_capture.stop()
-        docker_rm_force(broker_handle.container_name, paths.docker_log)
-        broker_handle.proc.terminate()
-        try:
-            broker_handle.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            broker_handle.proc.kill()
-        cleanup_stale_benchmark_containers(paths.docker_log)
-        docker_run(["clean-port"], paths.docker_log, check=False)
+            build_dir = build_firmware(
+                case,
+                paths,
+                args,
+                iterations=session_iterations,
+                warmup_iterations=session_warmups,
+            )
+        session_attempts = run_case_session(
+            session_index,
+            len(batches),
+            session_warmups,
+            session_iterations,
+            broker,
+            paths,
+            case,
+            args,
+            build_dir=build_dir,
+        )
+        attempts.extend(
+            renumber_attempts(
+                session_attempts,
+                start_index=next_attempt_index,
+                total_warmups=total_warmups,
+            )
+        )
+        next_attempt_index += len(session_attempts)
 
     if not attempts:
         attempts = [
@@ -811,7 +982,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None, help="run only the first N shuffled cases")
     parser.add_argument("--only-case", action="append", default=[], help="run only the selected case_id")
     parser.add_argument("--dry-run", action="store_true", help="create manifests/results without touching hardware")
-    parser.add_argument("--serial-device", default="/dev/ttyACM1")
+    parser.add_argument("--serial-device", default="/dev/ttyACM0")
     parser.add_argument("--serial-baud", type=int, default=115200)
     parser.add_argument("--serial-reader", choices=("cat", "tio"), default="cat")
     parser.add_argument("--case-timeout-sec", type=int, default=900)
@@ -828,12 +999,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-ipsp-ping-check", action="store_true")
     parser.add_argument("--ipsp-interface", default="bt0")
     parser.add_argument("--board-ipv6", default="2001:db8::1")
-    parser.add_argument("--ipsp-addr", default="F8:69:5E:1E:CE:2F")
+    parser.add_argument("--ipsp-addr", default="F9:79:AE:2A:9A:1E")
     parser.add_argument("--ipsp-addr-type", default="2")
     parser.add_argument("--sudo-noninteractive", action="store_true",
                         help="run IPSP sudo command with sudo -n so benchmarks never stop for a password prompt")
     parser.add_argument("--skip-flash", action="store_true",
                         help="reuse already flashed firmware/certs for the case and only reset the board")
+    parser.add_argument("--reset-after-case", action=argparse.BooleanOptionalAction, default=True,
+                        help="reset the board after each case to clear firmware/network state")
+    parser.add_argument("--session-attempt-limit", type=int, default=5,
+                        help="max warmup+measured attempts per IPSP session; 0 disables session splitting")
     parser.add_argument("--connect-retries", type=int, default=3,
                         help="firmware connection tries per BENCH_ATTEMPT")
     parser.add_argument("--connect-retry-delay-sec", type=float, default=10.0,
@@ -844,8 +1019,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nrfutil", default="/home/thiago/.local/bin/nrfutil")
     parser.add_argument("--ncs-version", default="v2.6.0")
     parser.add_argument("--ncs-chdir", default="/home/thiago/ncs/v2.6.0/nrf")
-    parser.add_argument("--board", default="nrf5340dk_nrf5340_cpuapp")
-    parser.add_argument("--serial-number", default="1050032722")
+    parser.add_argument("--board", default="nrf52840dk_nrf52840")
+    parser.add_argument("--sysbuild", action="store_true",
+                        help="build with Zephyr sysbuild; needed for nRF5340 DK, not for nRF52840 DK")
+    parser.add_argument("--nrf-family", default="nrf52",
+                        help="nrfutil family value, for example nrf52 or nrf53")
+    parser.add_argument("--serial-number", default="auto",
+                        help="J-Link serial number, or auto when exactly one nRF device is connected")
     parser.add_argument("--swd-clock-frequency", default="1000")
     return parser.parse_args()
 

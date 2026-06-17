@@ -19,4 +19,4 @@ system_default = system_default_sect
 
 [system_default_sect]
 MinProtocol = TLSv1.3
-Groups = MLKEM768
+Groups = MLKEM512

@@ -7,8 +7,10 @@ PQC="${PQC:-on}"
 BROKER_KEYLOG="${BROKER_KEYLOG:-off}"
 MQTT_HOST="${MQTT_HOST:-127.0.0.1}"
 MQTT_PORT="${MQTT_PORT:-8883}"
-MQTT_COMMAND_TOPIC="${MQTT_COMMAND_TOPIC:-nrf5340/command}"
-MQTT_TELEMETRY_TOPIC="${MQTT_TELEMETRY_TOPIC:-nrf5340/telemetry}"
+MQTT_COMMAND_TOPIC="${MQTT_COMMAND_TOPIC:-nrf52840/command}"
+MQTT_TELEMETRY_TOPIC="${MQTT_TELEMETRY_TOPIC:-nrf52840/telemetry}"
+IPSP_ADDR="${IPSP_ADDR:-F9:79:AE:2A:9A:1E}"
+IPSP_ADDR_TYPE="${IPSP_ADDR_TYPE:-2}"
 MQTT_CAFILE="${MQTT_CAFILE:-${ROOT_DIR}/host/certs/ca.crt}"
 MQTT_INSECURE="${MQTT_INSECURE:-1}"
 MQTT_TLS_VERSION="${MQTT_TLS_VERSION:-tlsv1.3}"
@@ -190,7 +192,7 @@ broker)
     ;;
 connect)
     ensure_project
-    exec "${ROOT_DIR}/host/ipsp_connect.sh" "${1:-F8:69:5E:1E:CE:2F}" "${2:-2}"
+    exec "${ROOT_DIR}/host/ipsp_connect.sh" "${1:-${IPSP_ADDR}}" "${2:-${IPSP_ADDR_TYPE}}"
     ;;
 console)
     ensure_project
