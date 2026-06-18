@@ -21,8 +21,8 @@ Commands:
   setup-openssl-conf     create benchmarking/work/openssl-benchmark.cnf
   oqs-check              show OpenSSL providers and benchmark groups
   gen-certs ...          run benchmarking/host/gen_benchmark_certs.py
-  build-broker ...       run benchmarking/host/build_benchmark_broker.sh
-  broker ...             run benchmarking/host/run_benchmark_broker.sh
+  build-broker ...       validate Mosquitto/OpenSSL/OQS benchmark support
+  broker ...             run Mosquitto with OpenSSL/OQS TLS settings
   clean-port             clear stale TCP state on MQTT_PORT=${MQTT_PORT}
   shell                  open bash
   help                   show this text

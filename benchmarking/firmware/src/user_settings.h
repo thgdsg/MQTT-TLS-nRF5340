@@ -9,6 +9,8 @@
 #define HAVE_ECC
 #define HAVE_FFDHE_2048
 #define WC_RSA_PSS
+#define WOLFSSL_PSS_LONG_SALT
+#define WOLFSSL_PSS_SALT_LEN_DISCOVER
 #define HAVE_AESGCM
 #define HAVE_HKDF
 #define HAVE_HASHDRBG
@@ -28,6 +30,14 @@
 #define NO_INT128
 #define NO_ASN_TIME_CHECK
 
+/*
+ * RSA-PSS-15360 certificates need big-integer operations beyond the default
+ * SP math limits. Heap math keeps those very large RSA verifies dynamic instead
+ * of requiring a huge fixed FP_MAX_BITS buffer on the nRF52840.
+ */
+#define USE_INTEGER_HEAP_MATH
+#define RSA_MAX_SIZE 16384
+
 #ifdef CONFIG_WOLFSSL_MLKEM
 #define WOLFSSL_HAVE_MLKEM
 #endif
@@ -38,6 +48,7 @@
  * of falling back to a different algorithm silently.
  */
 #define WOLFSSL_HAVE_MLDSA
+#define WOLFSSL_MLDSA_VERIFY_SMALL_MEM
 #define WOLFSSL_HAVE_SLHDSA
 #define WOLFSSL_WC_SLHDSA
 

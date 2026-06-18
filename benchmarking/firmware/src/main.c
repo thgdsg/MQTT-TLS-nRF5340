@@ -19,6 +19,7 @@
 #include <zephyr/posix/fcntl.h>
 #include <zephyr/sys/sys_heap.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/sys/reboot.h>
 #include <zephyr/sys/util.h>
 
 #include <wolfssl/options.h>
@@ -29,12 +30,12 @@
 #include "benchmark_cert.h"
 
 #define MQTT_BUFFER_SIZE 4096
-#define MQTT_CMD_TIMEOUT_MS 5000
-#define MQTT_TLS_HANDSHAKE_TIMEOUT_MS 120000
-#define MQTT_TLS_IO_TIMEOUT_MS 20000
-#define MQTT_KEEPALIVE_SEC 10
-#define BLE_IPSP_WRITE_CHUNK 64
-#define BLE_IPSP_WRITE_PAUSE_MS 0
+#define MQTT_CMD_TIMEOUT_MS CONFIG_APP_MQTT_CMD_TIMEOUT_MS
+#define MQTT_TLS_HANDSHAKE_TIMEOUT_MS CONFIG_APP_TLS_HANDSHAKE_TIMEOUT_MS
+#define MQTT_TLS_IO_TIMEOUT_MS CONFIG_APP_TLS_IO_TIMEOUT_MS
+#define MQTT_KEEPALIVE_SEC CONFIG_APP_MQTT_KEEPALIVE_SEC
+#define BLE_IPSP_WRITE_CHUNK 256
+#define BLE_IPSP_WRITE_PAUSE_MS 1
 
 #ifndef APP_TLS_GROUP_ID
 #define APP_TLS_GROUP_ID WOLFSSL_ML_KEM_512
@@ -42,6 +43,14 @@
 
 #ifndef APP_TLS_GROUP_NAME
 #define APP_TLS_GROUP_NAME "MLKEM512"
+#endif
+
+#define BENCH_EVENT(...) printk(__VA_ARGS__)
+
+#if defined(CONFIG_APP_BENCH_VERBOSE_LOGS)
+#define BENCH_DEBUG(...) printk(__VA_ARGS__)
+#else
+#define BENCH_DEBUG(...) do { } while (0)
 #endif
 
 struct socket_context {
@@ -54,6 +63,7 @@ struct bench_metrics {
 	int mqtt_connect_ms;
 	int full_connect_ms;
 	int error_code;
+	int tls_last_error;
 };
 
 static byte tx_buf[MQTT_BUFFER_SIZE];
@@ -91,9 +101,9 @@ void *XMALLOC(size_t n, void *heap, int type)
 	hdr = k_malloc(total);
 	if (!hdr) {
 		wolfssl_alloc_failures++;
-		printk("wolfSSL XMALLOC failed: size=%zu type=%d current=%zu max=%zu failures=%zu\n",
-		       n, type, wolfssl_allocated, wolfssl_max_allocated,
-		       wolfssl_alloc_failures);
+		BENCH_DEBUG("wolfSSL XMALLOC failed: size=%zu type=%d current=%zu max=%zu failures=%zu\n",
+			    n, type, wolfssl_allocated, wolfssl_max_allocated,
+			    wolfssl_alloc_failures);
 		return NULL;
 	}
 
@@ -159,11 +169,12 @@ void *XREALLOC(void *p, size_t n, void *heap, int type)
 	return new_ptr;
 }
 
+#if defined(CONFIG_APP_BENCH_VERBOSE_LOGS)
 static void print_wolfssl_mem(const char *tag)
 {
-	printk("wolfssl_mem[%s]: current=%zu max=%zu failures=%zu\n",
-	       tag, wolfssl_allocated, wolfssl_max_allocated,
-	       wolfssl_alloc_failures);
+	BENCH_DEBUG("wolfssl_mem[%s]: current=%zu max=%zu failures=%zu\n",
+		    tag, wolfssl_allocated, wolfssl_max_allocated,
+		    wolfssl_alloc_failures);
 }
 
 #if defined(CONFIG_SYS_HEAP_RUNTIME_STATS)
@@ -176,11 +187,11 @@ static void print_heap_stats(const char *tag)
 
 	rc = sys_heap_runtime_stats_get(&_system_heap.heap, &stats);
 	if (rc == 0) {
-		printk("heap[%s]: free=%zu allocated=%zu max_allocated=%zu\n",
-		       tag, stats.free_bytes, stats.allocated_bytes,
-		       stats.max_allocated_bytes);
+		BENCH_DEBUG("heap[%s]: free=%zu allocated=%zu max_allocated=%zu\n",
+			    tag, stats.free_bytes, stats.allocated_bytes,
+			    stats.max_allocated_bytes);
 	} else {
-		printk("heap[%s]: stats unavailable rc=%d\n", tag, rc);
+		BENCH_DEBUG("heap[%s]: stats unavailable rc=%d\n", tag, rc);
 	}
 }
 #else
@@ -195,6 +206,12 @@ static void print_memory_stats(const char *tag)
 	print_heap_stats(tag);
 	print_wolfssl_mem(tag);
 }
+#else
+static void print_memory_stats(const char *tag)
+{
+	ARG_UNUSED(tag);
+}
+#endif
 
 static int set_socket_timeout(int fd, int optname, int timeout_ms)
 {
@@ -237,13 +254,13 @@ static int net_connect(void *context, const char *host, word16 port,
 
 	rc = zsock_inet_pton(AF_INET6, host, &addr6.sin6_addr);
 	if (rc != 1) {
-		printk("invalid broker IPv6 address %s\n", host);
+		BENCH_DEBUG("invalid broker IPv6 address %s\n", host);
 		return MQTT_CODE_ERROR_NETWORK;
 	}
 
 	sock->fd = zsock_socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
 	if (sock->fd < 0) {
-		printk("socket failed: errno=%d\n", errno);
+		BENCH_DEBUG("socket failed: errno=%d\n", errno);
 		return MQTT_CODE_ERROR_NETWORK;
 	}
 
@@ -254,27 +271,20 @@ static int net_connect(void *context, const char *host, word16 port,
 	rc = zsock_connect(sock->fd, (struct sockaddr *)&addr6, sizeof(addr6));
 	last_tcp_connect_ms = (int)k_uptime_delta(&start);
 	if (rc < 0) {
-		printk("connect failed: errno=%d\n", errno);
+		BENCH_DEBUG("connect failed: errno=%d\n", errno);
 		(void)zsock_close(sock->fd);
 		sock->fd = -1;
 		return MQTT_CODE_ERROR_NETWORK;
 	}
 
-	printk("TCP connected in %d ms\n", last_tcp_connect_ms);
+	BENCH_DEBUG("TCP connected in %d ms\n", last_tcp_connect_ms);
 	{
 		int one = 1;
 
 		rc = zsock_setsockopt(sock->fd, IPPROTO_TCP, TCP_NODELAY,
 				      &one, sizeof(one));
 		if (rc < 0) {
-			printk("TCP_NODELAY failed: errno=%d\n", errno);
-		}
-	}
-	rc = zsock_fcntl(sock->fd, F_GETFL, 0);
-	if (rc >= 0) {
-		rc = zsock_fcntl(sock->fd, F_SETFL, rc | O_NONBLOCK);
-		if (rc < 0) {
-			printk("fcntl O_NONBLOCK failed: errno=%d\n", errno);
+			BENCH_DEBUG("TCP_NODELAY failed: errno=%d\n", errno);
 		}
 	}
 	return MQTT_CODE_SUCCESS;
@@ -290,7 +300,6 @@ static int net_read(void *context, byte *buf, int buf_len, int timeout_ms)
 	}
 
 	deadline = k_uptime_get() + timeout_ms;
-
 	while (k_uptime_get() < deadline) {
 		int rc = zsock_recv(sock->fd, buf, buf_len, ZSOCK_MSG_DONTWAIT);
 
@@ -299,6 +308,7 @@ static int net_read(void *context, byte *buf, int buf_len, int timeout_ms)
 				k_sleep(K_MSEC(10));
 				continue;
 			}
+			BENCH_DEBUG("recv failed: errno=%d\n", errno);
 			return MQTT_CODE_ERROR_NETWORK;
 		}
 
@@ -337,13 +347,13 @@ static int net_write(void *context, const byte *buf, int buf_len, int timeout_ms
 					k_sleep(K_MSEC(BLE_IPSP_WRITE_PAUSE_MS));
 					continue;
 				}
-				printk("net_write timeout: errno=%d total=%d requested=%d\n",
-				       err, total, buf_len);
+				BENCH_DEBUG("net_write timeout: errno=%d total=%d requested=%d\n",
+					    err, total, buf_len);
 				return MQTT_CODE_ERROR_NETWORK;
 			}
 
-			printk("net_write failed: errno=%d total=%d requested=%d\n",
-			       err, total, buf_len);
+			BENCH_DEBUG("net_write failed: errno=%d total=%d requested=%d\n",
+				    err, total, buf_len);
 			return total > 0 ? total : MQTT_CODE_ERROR_NETWORK;
 		}
 
@@ -373,6 +383,20 @@ static int net_disconnect(void *context)
 	return MQTT_CODE_SUCCESS;
 }
 
+static void reset_benchmark_client_state(void)
+{
+	if (sock_ctx.fd >= 0) {
+		(void)net_disconnect(&sock_ctx);
+	}
+
+	memset(&mqtt_client, 0, sizeof(mqtt_client));
+	memset(&mqtt_net, 0, sizeof(mqtt_net));
+	memset(tx_buf, 0, sizeof(tx_buf));
+	memset(rx_buf, 0, sizeof(rx_buf));
+	sock_ctx.fd = -1;
+	last_tcp_connect_ms = 0;
+}
+
 static int mqtt_message_cb(MqttClient *client, MqttMessage *message,
 			   byte msg_new, byte msg_done)
 {
@@ -387,8 +411,8 @@ static int mqtt_message_cb(MqttClient *client, MqttMessage *message,
 static int tls_verify_cb(int preverify, WOLFSSL_X509_STORE_CTX *store)
 {
 	if (!preverify && store && store->error != 0) {
-		printk("TLS verify failed: error=%d depth=%d\n",
-		       store->error, store->error_depth);
+		BENCH_DEBUG("TLS verify failed: error=%d depth=%d\n",
+		    store->error, store->error_depth);
 	}
 
 	/*
@@ -410,7 +434,7 @@ static int tls_setup_cb(MqttClient *client)
 
 	client->tls.ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
 	if (!client->tls.ctx) {
-		printk("wolfSSL_CTX_new failed\n");
+		BENCH_DEBUG("wolfSSL_CTX_new failed\n");
 		print_memory_stats("ctx_new_failed");
 		return WOLFSSL_FAILURE;
 	}
@@ -423,7 +447,7 @@ static int tls_setup_cb(MqttClient *client)
 					    sizeof(ca_cert_pem) - 1,
 					    WOLFSSL_FILETYPE_PEM);
 	if (rc != WOLFSSL_SUCCESS) {
-		printk("wolfSSL_CTX_load_verify_buffer failed: %d\n", rc);
+		BENCH_DEBUG("wolfSSL_CTX_load_verify_buffer failed: %d\n", rc);
 		print_memory_stats("load_ca_failed");
 		wolfSSL_CTX_free(client->tls.ctx);
 		client->tls.ctx = NULL;
@@ -432,14 +456,14 @@ static int tls_setup_cb(MqttClient *client)
 
 	rc = wolfSSL_CTX_set_groups(client->tls.ctx, groups, ARRAY_SIZE(groups));
 	if (rc != WOLFSSL_SUCCESS) {
-		printk("wolfSSL_CTX_set_groups failed: %d\n", rc);
+		BENCH_DEBUG("wolfSSL_CTX_set_groups failed: %d\n", rc);
 		print_memory_stats("set_groups_failed");
 		wolfSSL_CTX_free(client->tls.ctx);
 		client->tls.ctx = NULL;
 		return WOLFSSL_FAILURE;
 	}
 
-	printk("TLS 1.3 key exchange group: %s\n", APP_TLS_GROUP_NAME);
+	BENCH_DEBUG("TLS 1.3 key exchange group: %s\n", APP_TLS_GROUP_NAME);
 	print_memory_stats("tls_setup_done");
 
 	return WOLFSSL_SUCCESS;
@@ -478,21 +502,22 @@ static int mqtt_tls_net_connect(struct bench_metrics *metrics)
 
 		if (rc != MQTT_CODE_CONTINUE &&
 		    rc != MQTT_CODE_ERROR_TIMEOUT) {
-			printk("MqttClient_NetConnect TLS failed: %d "
-			       "lastError=%d sockRcRead=%d sockRcWrite=%d\n",
-			       rc, mqtt_client.tls.lastError,
-			       mqtt_client.tls.sockRcRead,
-			       mqtt_client.tls.sockRcWrite);
+			BENCH_DEBUG("MqttClient_NetConnect TLS failed: %d "
+				    "lastError=%d sockRcRead=%d sockRcWrite=%d\n",
+				    rc, mqtt_client.tls.lastError,
+				    mqtt_client.tls.sockRcRead,
+				    mqtt_client.tls.sockRcWrite);
 			print_memory_stats("tls_connect_failed");
 			metrics->error_code = rc;
+			metrics->tls_last_error = mqtt_client.tls.lastError;
 			(void)MqttClient_NetDisconnect(&mqtt_client);
 			return rc;
 		}
 
-		k_sleep(K_MSEC(100));
 	} while (k_uptime_get() < deadline);
 
 	metrics->error_code = MQTT_CODE_ERROR_TIMEOUT;
+	metrics->tls_last_error = mqtt_client.tls.lastError;
 	print_memory_stats("tls_connect_timeout");
 	(void)MqttClient_NetDisconnect(&mqtt_client);
 	return MQTT_CODE_ERROR_TIMEOUT;
@@ -517,8 +542,8 @@ static int mqtt_connect_subscribe_publish(struct bench_metrics *metrics)
 
 	rc = MqttClient_Connect(&mqtt_client, &connect);
 	if (rc != MQTT_CODE_SUCCESS) {
-		printk("MqttClient_Connect failed: %d ack=%u\n",
-		       rc, connect.ack.return_code);
+		BENCH_DEBUG("MqttClient_Connect failed: %d ack=%u\n",
+		    rc, connect.ack.return_code);
 		metrics->error_code = rc;
 		return rc;
 	}
@@ -534,7 +559,7 @@ static int mqtt_connect_subscribe_publish(struct bench_metrics *metrics)
 
 	rc = MqttClient_Subscribe(&mqtt_client, &subscribe);
 	if (rc != MQTT_CODE_SUCCESS) {
-		printk("MqttClient_Subscribe failed: %d\n", rc);
+		BENCH_DEBUG("MqttClient_Subscribe failed: %d\n", rc);
 		metrics->error_code = rc;
 		return rc;
 	}
@@ -549,7 +574,7 @@ static int mqtt_connect_subscribe_publish(struct bench_metrics *metrics)
 
 	rc = MqttClient_Publish(&mqtt_client, &publish);
 	if (rc != MQTT_CODE_SUCCESS) {
-		printk("MqttClient_Publish failed: %d\n", rc);
+		BENCH_DEBUG("MqttClient_Publish failed: %d\n", rc);
 		metrics->error_code = rc;
 		return rc;
 	}
@@ -564,6 +589,7 @@ static int run_one_attempt(struct bench_metrics *metrics)
 	int rc;
 
 	memset(metrics, 0, sizeof(*metrics));
+	reset_benchmark_client_state();
 	mqtt_net_init();
 
 	rc = MqttClient_Init(&mqtt_client, &mqtt_net, mqtt_message_cb,
@@ -571,6 +597,7 @@ static int run_one_attempt(struct bench_metrics *metrics)
 			     MQTT_CMD_TIMEOUT_MS);
 	if (rc != MQTT_CODE_SUCCESS) {
 		metrics->error_code = rc;
+		reset_benchmark_client_state();
 		return rc;
 	}
 
@@ -586,6 +613,7 @@ static int run_one_attempt(struct bench_metrics *metrics)
 	}
 	(void)MqttClient_NetDisconnect(&mqtt_client);
 	MqttClient_DeInit(&mqtt_client);
+	reset_benchmark_client_state();
 	print_memory_stats(rc == MQTT_CODE_SUCCESS ? "attempt_done" : "attempt_failed");
 	return rc;
 }
@@ -593,25 +621,39 @@ static int run_one_attempt(struct bench_metrics *metrics)
 static int run_one_attempt_with_retries(int attempt_index,
 					struct bench_metrics *metrics)
 {
+	struct bench_metrics first_tls_error_metrics;
+	bool have_tls_error = false;
 	int rc = MQTT_CODE_ERROR_NETWORK;
+
+	memset(&first_tls_error_metrics, 0, sizeof(first_tls_error_metrics));
 
 	for (int try_index = 1; try_index <= CONFIG_APP_BENCH_CONNECT_RETRIES;
 	     try_index++) {
 		rc = run_one_attempt(metrics);
 		if (rc == MQTT_CODE_SUCCESS) {
 			if (try_index > 1) {
-				printk("BENCH_RETRY_OK,%d,%d\n", attempt_index,
-				       try_index);
+				BENCH_DEBUG("BENCH_RETRY_OK,%d,%d\n",
+					    attempt_index, try_index);
 			}
 			return rc;
 		}
 
-		printk("BENCH_RETRY,%d,%d,%d,connect_failed\n",
-		       attempt_index, try_index, rc);
+		if (!have_tls_error && metrics->tls_last_error != 0) {
+			first_tls_error_metrics = *metrics;
+			have_tls_error = true;
+		}
+
+		BENCH_DEBUG("BENCH_RETRY,%d,%d,%d,connect_failed\n",
+			    attempt_index, try_index, rc);
 
 		if (try_index < CONFIG_APP_BENCH_CONNECT_RETRIES) {
 			k_sleep(K_MSEC(CONFIG_APP_BENCH_CONNECT_RETRY_DELAY_MS));
 		}
+	}
+
+	if (have_tls_error && metrics->tls_last_error == 0) {
+		*metrics = first_tls_error_metrics;
+		rc = metrics->error_code;
 	}
 
 	return rc;
@@ -632,33 +674,33 @@ static void ensure_static_ipv6_address(void)
 	int rc;
 
 	if (!iface) {
-		printk("No default network interface for static IPv6\n");
+		BENCH_DEBUG("No default network interface for static IPv6\n");
 		return;
 	}
 
 	rc = zsock_inet_pton(AF_INET6, CONFIG_NET_CONFIG_MY_IPV6_ADDR, &addr);
 	if (rc != 1) {
-		printk("Invalid board IPv6 address: %s\n",
-		       CONFIG_NET_CONFIG_MY_IPV6_ADDR);
+		BENCH_DEBUG("Invalid board IPv6 address: %s\n",
+		    CONFIG_NET_CONFIG_MY_IPV6_ADDR);
 		return;
 	}
 
 	ifaddr = net_if_ipv6_addr_lookup_by_iface(iface, &addr);
 	if (ifaddr) {
-		printk("Static IPv6 already configured: %s\n",
-		       CONFIG_NET_CONFIG_MY_IPV6_ADDR);
+		BENCH_DEBUG("Static IPv6 already configured: %s\n",
+		    CONFIG_NET_CONFIG_MY_IPV6_ADDR);
 		return;
 	}
 
 	ifaddr = net_if_ipv6_addr_add(iface, &addr, NET_ADDR_MANUAL, 0);
 	if (!ifaddr) {
-		printk("Failed to add static IPv6: %s\n",
-		       CONFIG_NET_CONFIG_MY_IPV6_ADDR);
+		BENCH_DEBUG("Failed to add static IPv6: %s\n",
+		    CONFIG_NET_CONFIG_MY_IPV6_ADDR);
 		return;
 	}
 
-	printk("Static IPv6 configured manually: %s\n",
-	       CONFIG_NET_CONFIG_MY_IPV6_ADDR);
+	BENCH_DEBUG("Static IPv6 configured manually: %s\n",
+	    CONFIG_NET_CONFIG_MY_IPV6_ADDR);
 }
 
 int main(void)
@@ -669,31 +711,41 @@ int main(void)
 	struct bench_metrics metrics;
 	int rc;
 
-	printk("BENCH_START,group,%s,warmups,%d,iterations,%d\n",
+	BENCH_EVENT("BENCH_START,group,%s,warmups,%d,iterations,%d\n",
 	       APP_TLS_GROUP_NAME, warmups, iterations);
-	printk("Board IPv6: %s\n", CONFIG_NET_CONFIG_MY_IPV6_ADDR);
-	printk("Broker: [%s]:%d\n", CONFIG_APP_MQTT_BROKER_HOST,
-	       CONFIG_APP_MQTT_BROKER_PORT);
+	BENCH_DEBUG("Board IPv6: %s\n", CONFIG_NET_CONFIG_MY_IPV6_ADDR);
+	BENCH_DEBUG("Broker: [%s]:%d\n", CONFIG_APP_MQTT_BROKER_HOST,
+	    CONFIG_APP_MQTT_BROKER_PORT);
 	print_memory_stats("boot");
 
 	rc = net_config_init_app(NULL, "Initializing IPSP benchmark network");
-	printk("net_config_init_app returned: %d\n", rc);
+	BENCH_DEBUG("net_config_init_app returned: %d\n", rc);
 	ensure_static_ipv6_address();
 
 	while (!network_ready()) {
-		printk("Waiting for IPSP network interface...\n");
+		BENCH_DEBUG("Waiting for IPSP network interface...\n");
 		k_sleep(K_SECONDS(5));
 	}
 
-	printk("BENCH_READY,initial_delay_ms,%d\n",
+	BENCH_EVENT("BENCH_READY,initial_delay_ms,%d\n",
 	       CONFIG_APP_BENCH_INITIAL_DELAY_MS);
 	k_sleep(K_MSEC(CONFIG_APP_BENCH_INITIAL_DELAY_MS));
 
 	for (int i = 1; i <= total_attempts; i++) {
 		int warmup = i <= warmups ? 1 : 0;
+		char message[48];
 
 		rc = run_one_attempt_with_retries(i, &metrics);
-		printk("BENCH_ATTEMPT,%d,%d,%s,%d,%d,%d,%d,%d,%s\n",
+		if (rc == MQTT_CODE_SUCCESS) {
+			snprintf(message, sizeof(message), "ok");
+		} else if (metrics.tls_last_error != 0) {
+			snprintf(message, sizeof(message), "tls_last_error=%d",
+				 metrics.tls_last_error);
+		} else {
+			snprintf(message, sizeof(message), "connect_failed");
+		}
+
+		BENCH_EVENT("BENCH_ATTEMPT,%d,%d,%s,%d,%d,%d,%d,%d,%s\n",
 		       i, warmup,
 		       rc == MQTT_CODE_SUCCESS ? "success" :
 		       rc == MQTT_CODE_ERROR_TIMEOUT ? "timeout" : "error",
@@ -702,11 +754,17 @@ int main(void)
 		       metrics.mqtt_connect_ms,
 		       metrics.full_connect_ms,
 		       metrics.error_code,
-		       rc == MQTT_CODE_SUCCESS ? "ok" : "connect_failed");
+		       message);
+
+		if (IS_ENABLED(CONFIG_APP_BENCH_REBOOT_AFTER_ATTEMPT)) {
+			k_sleep(K_MSEC(1500));
+			sys_reboot(SYS_REBOOT_COLD);
+		}
+
 		k_sleep(K_MSEC(CONFIG_APP_BENCH_PAUSE_MS));
 	}
 
-	printk("BENCH_DONE,total,%d\n", total_attempts);
+	BENCH_EVENT("BENCH_DONE,total,%d\n", total_attempts);
 	while (1) {
 		k_sleep(K_SECONDS(60));
 	}

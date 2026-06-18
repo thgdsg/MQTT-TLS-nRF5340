@@ -22,6 +22,22 @@ config APP_MQTT_COMMAND_TOPIC
 	string "MQTT command topic"
 	default "nrf52840/benchmark/command"
 
+config APP_MQTT_CMD_TIMEOUT_MS
+	int "wolfMQTT command timeout in milliseconds"
+	default 15000
+
+config APP_TLS_HANDSHAKE_TIMEOUT_MS
+	int "TLS handshake timeout in milliseconds"
+	default 300000
+
+config APP_TLS_IO_TIMEOUT_MS
+	int "TLS socket I/O timeout in milliseconds"
+	default 60000
+
+config APP_MQTT_KEEPALIVE_SEC
+	int "MQTT keepalive in seconds"
+	default 60
+
 config APP_BENCH_ITERATIONS
 	int "Measured benchmark attempts"
 	default 10
@@ -45,6 +61,22 @@ config APP_BENCH_CONNECT_RETRIES
 config APP_BENCH_CONNECT_RETRY_DELAY_MS
 	int "Delay after a failed connection try"
 	default 500
+
+config APP_BENCH_REBOOT_AFTER_ATTEMPT
+	bool "Reboot after each benchmark attempt"
+	default n
+	help
+	  Use this when the benchmark runner executes one attempt per IPSP
+	  session. It gives each measured connection a fresh firmware/network
+	  state without reflashing the board.
+
+config APP_BENCH_VERBOSE_LOGS
+	bool "Print verbose benchmark debug logs"
+	default n
+	help
+	  Enable diagnostic printk output around TCP/TLS/MQTT setup and memory
+	  accounting. Keep this disabled for benchmark runs to avoid serial output
+	  affecting timing. Essential BENCH_* CSV lines are still printed.
 
 choice APP_BENCH_TLS_GROUP
 	prompt "TLS 1.3 key exchange group"

@@ -1,4 +1,4 @@
-# nRF5340 IPSP MQTT/TLS Benchmarking
+# nRF52840 IPSP MQTT/TLS Benchmarking
 
 This directory is an isolated benchmark environment. It does not overwrite the
 existing `firmware/`, `host/`, `scripts/`, `docker/`, `docker-compose.server.yml`,
@@ -6,8 +6,10 @@ or `modules/` flow.
 
 ## What It Measures
 
-The benchmark uses the real nRF5340 DK over IPSP / IPv6-over-BLE and measures
-TLS/MQTT connection cycles against a benchmark-only wolfMQTT broker.
+The benchmark uses the real nRF52840 DK over IPSP / IPv6-over-BLE and measures
+TLS/MQTT connection cycles against a benchmark-only Mosquitto broker. The server
+side uses system OpenSSL plus the Open Quantum Safe provider (`oqsprovider`) for
+post-quantum TLS groups and certificate algorithms.
 
 Initial metrics:
 
@@ -16,8 +18,9 @@ Initial metrics:
 - Connections per second.
 - Success, failure, timeout, and unsupported counts.
 
-ML-KEM is tested as the TLS 1.3 key exchange group. ML-DSA, SLH-DSA, RSA-PSS,
-and DSA are treated as server certificate/signature variants. Unsupported
+ML-KEM is tested as the TLS 1.3 key exchange group. ECDHE P-256/P-384/P-521 are
+available as classical key-exchange baselines. ML-DSA, SLH-DSA, ECDSA, and
+RSA-PSS are treated as server certificate/signature variants. Unsupported
 combinations are recorded as `unsupported`; the runner does not silently fall
 back to a different algorithm.
 
@@ -88,11 +91,12 @@ python benchmarking/run_benchmarks.py \
 The runner will:
 
 1. Generate per-case certificates under `benchmarking/results/<run_id>/cases/...`.
-2. Build the benchmark broker in `benchmarking/work/build/`.
+2. Validate the Mosquitto/OpenSSL/OQS broker environment.
 3. Build the benchmark firmware in `benchmarking/work/firmware-build/`.
 4. Flash the board with `nrfutil`.
 5. Reconnect IPSP using the existing `host/ipsp_connect.sh`.
-6. Start the benchmark broker in Docker.
+6. Start Mosquitto in Docker with a per-case OpenSSL config that sets the TLS
+   group, for example `Groups = MLKEM512`.
 7. Parse serial `BENCH_ATTEMPT` lines and write CSV output.
 
 The default benchmark target is now `nrf52840dk_nrf52840`, using nRF52
@@ -144,8 +148,11 @@ Useful hardware-run options:
   cryptographic combination.
 - `--connect-retries 5`: firmware connection tries per measured attempt.
 - `--connect-retry-delay-sec 5`: wait time between failed connection tries.
-- `--initial-delay-sec 45`: firmware wait before the first measured attempt,
-  giving the host time to create and validate `bt0`.
+- `--initial-delay-sec 30`: firmware wait before the first measured attempt,
+  giving the host time to create and validate `bt0` and allowing IPSP/IPv6
+  neighbor discovery to settle before `tcp_connect_ms` is measured. Lower
+  values such as `--initial-delay-sec 3` are useful when you intentionally want
+  to include cold-link startup cost in the first attempt.
 - `--case-timeout-sec 900`: max serial collection time for a case.
 - `--board-boot-timeout-sec 30`: max wait for `BENCH_START` after reset.
 - `--broker-ready-timeout-sec 20`: max wait for the Docker broker to listen.
@@ -182,7 +189,8 @@ See `schemas.md` for exact columns.
 
 - Firmware build and flash are intentionally host-native, because your NCS and
   `nrfutil` flow already works on CachyOS.
-- Docker is used for server-side benchmark dependencies only.
+- Docker is used for server-side benchmark dependencies only: Mosquitto,
+  OpenSSL, liboqs, and oqs-provider.
 - The benchmark runner refuses to overwrite an existing `results/<run_id>`.
 - The current project implementation remains available through the original
   scripts and Docker files.

@@ -22,9 +22,15 @@ ALG_MAP = {
     "ECDSA-P-256": {"openssl": "EC", "curve": "prime256v1", "digest": "-sha256"},
     "ECDSA-P-384": {"openssl": "EC", "curve": "secp384r1", "digest": "-sha384"},
     "ECDSA-P-521": {"openssl": "EC", "curve": "secp521r1", "digest": "-sha512"},
-    "RSA-PSS-3072": {"openssl": "RSA", "bits": "3072", "digest": "-sha384"},
-    "RSA-PSS-7680": {"openssl": "RSA", "bits": "7680", "digest": "-sha384"},
-    "RSA-PSS-15360": {"openssl": "RSA", "bits": "15360", "digest": "-sha512"},
+    "RSA-PSS-3072": {"openssl": "RSA-PSS", "bits": "3072", "digest": "-sha384"},
+    "RSA-PSS-7680": {"openssl": "RSA-PSS", "bits": "7680", "digest": "-sha384"},
+    "RSA-PSS-15360": {"openssl": "RSA-PSS", "bits": "15360", "digest": "-sha512"},
+}
+
+RSA_PSS_SALT_LEN = {
+    "-sha256": "32",
+    "-sha384": "48",
+    "-sha512": "64",
 }
 
 
@@ -42,7 +48,23 @@ def run(cmd: list[str], cwd: Path | None = None) -> None:
 def gen_key(algorithm: str, output: Path) -> None:
     spec = ALG_MAP[algorithm]
     cmd = ["openssl", "genpkey", "-algorithm", str(spec["openssl"])]
-    if spec["openssl"] == "RSA":
+    if spec["openssl"] == "RSA-PSS":
+        digest_arg = str(spec["digest"])
+        digest = digest_arg.lstrip("-")
+        salt_len = RSA_PSS_SALT_LEN[digest_arg]
+        cmd.extend(
+            [
+                "-pkeyopt",
+                f"rsa_keygen_bits:{spec['bits']}",
+                "-pkeyopt",
+                f"rsa_pss_keygen_md:{digest}",
+                "-pkeyopt",
+                f"rsa_pss_keygen_mgf1_md:{digest}",
+                "-pkeyopt",
+                f"rsa_pss_keygen_saltlen:{salt_len}",
+            ]
+        )
+    elif spec["openssl"] == "RSA":
         cmd.extend(["-pkeyopt", f"rsa_keygen_bits:{spec['bits']}"])
     elif spec["openssl"] == "EC":
         cmd.extend(["-pkeyopt", f"ec_paramgen_curve:{spec['curve']}"])
@@ -53,6 +75,23 @@ def gen_key(algorithm: str, output: Path) -> None:
 def req_or_x509_digest_args(algorithm: str) -> list[str]:
     digest = ALG_MAP[algorithm].get("digest")
     return [str(digest)] if digest else []
+
+
+def rsa_pss_sigopt_args(algorithm: str) -> list[str]:
+    if not algorithm.startswith("RSA-PSS-"):
+        return []
+
+    digest_arg = str(ALG_MAP[algorithm]["digest"])
+    digest = digest_arg.lstrip("-")
+    salt_len = RSA_PSS_SALT_LEN[digest_arg]
+    return [
+        "-sigopt",
+        "rsa_padding_mode:pss",
+        "-sigopt",
+        f"rsa_pss_saltlen:{salt_len}",
+        "-sigopt",
+        f"rsa_mgf1_md:{digest}",
+    ]
 
 
 def server_key_algorithm(cert_sig: str) -> str:
@@ -79,7 +118,7 @@ def write_server_ext(path: Path, host_ip: str, host_dns: str) -> None:
             [
                 "authorityKeyIdentifier=keyid,issuer",
                 "basicConstraints=CA:FALSE",
-                "keyUsage=digitalSignature,keyEncipherment",
+                "keyUsage=digitalSignature",
                 "extendedKeyUsage=serverAuth",
                 f"subjectAltName=DNS:{host_dns},IP:{host_ip}",
                 "",
@@ -142,6 +181,7 @@ def main() -> int:
             str(ca_key),
             "-subj",
             f"/CN=bench-ca-{args.case_id}",
+            *rsa_pss_sigopt_args(args.cert_sig),
             "-out",
             str(ca_csr),
         ]
@@ -157,6 +197,7 @@ def main() -> int:
             "-signkey",
             str(ca_key),
             *req_or_x509_digest_args(args.cert_sig),
+            *rsa_pss_sigopt_args(args.cert_sig),
             "-days",
             "3650",
             "-extensions",
@@ -177,6 +218,7 @@ def main() -> int:
             str(server_key),
             "-subj",
             f"/CN={args.host_dns}",
+            *rsa_pss_sigopt_args(server_sig),
             "-out",
             str(server_csr),
         ]
@@ -200,6 +242,7 @@ def main() -> int:
             "-days",
             "825",
             *req_or_x509_digest_args(args.cert_sig),
+            *rsa_pss_sigopt_args(args.cert_sig),
             "-extfile",
             str(server_ext),
         ]

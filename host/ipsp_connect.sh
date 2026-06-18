@@ -3,14 +3,11 @@ set -euo pipefail
 
 if [ $# -lt 1 ]; then
     printf 'Usage: sudo %s <BLE_ADDR> [addr_type]\n' "$0"
+    printf '       sudo %s --cleanup [interface]\n' "$0"
     printf 'Example: sudo %s AA:BB:CC:DD:EE:FF 2\n' "$0"
     exit 1
 fi
 
-BLE_ADDR="$1"
-# Linux bluetooth_6lowpan expects the LE address type as a number.
-# For Nordic DKs advertising with a random BLE address, type 2 is the usual value.
-ADDR_TYPE="${2:-2}"
 DEBUGFS="/sys/kernel/debug"
 BT_DEBUG="${DEBUGFS}/bluetooth"
 LOWPAN_ENABLE="${BT_DEBUG}/6lowpan_enable"
@@ -21,6 +18,32 @@ if [ "$(id -u)" -ne 0 ]; then
     printf 'This script must run as root. Use: sudo %s ...\n' "$0"
     exit 1
 fi
+
+cleanup_ipsp_interface() {
+    local iface="${1:-bt0}"
+
+    # Repeated benchmark sessions can leave neighbor/TCP/6LoWPAN state behind.
+    # Keep this cleanup inside the root-owned IPSP helper so callers can grant
+    # sudo only for this script instead of permitting arbitrary shell commands.
+    if ip link show "${iface}" >/dev/null 2>&1; then
+        printf 'Cleaning IPSP interface %s...\n' "${iface}"
+        ip -6 neigh flush dev "${iface}" 2>/dev/null || true
+        ip address flush dev "${iface}" 2>/dev/null || true
+        ip link set "${iface}" down 2>/dev/null || true
+    else
+        printf 'IPSP interface %s is not present; nothing to clean.\n' "${iface}"
+    fi
+}
+
+if [ "$1" = "--cleanup" ]; then
+    cleanup_ipsp_interface "${2:-bt0}"
+    exit 0
+fi
+
+BLE_ADDR="$1"
+# Linux bluetooth_6lowpan expects the LE address type as a number.
+# For Nordic DKs advertising with a random BLE address, type 2 is the usual value.
+ADDR_TYPE="${2:-2}"
 
 # The Bluetooth 6LoWPAN control files are exposed through debugfs.
 if ! mountpoint -q "${DEBUGFS}"; then
@@ -58,11 +81,7 @@ fi
 
 # A failed TLS/IPSP run can leave bt0 around with stale IPv6/TCP state. Bring
 # it down before asking bluetooth_6lowpan to create a fresh peer link.
-if ip link show bt0 >/dev/null 2>&1; then
-    printf 'Clearing stale bt0 network interface...\n'
-    ip link set bt0 down 2>/dev/null || true
-    ip address flush dev bt0 2>/dev/null || true
-fi
+cleanup_ipsp_interface bt0
 
 # Print the cached bluetoothctl view before connecting. This is useful to
 # confirm the address type, bonding state, and IPSP service UUID.

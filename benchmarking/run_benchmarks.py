@@ -132,6 +132,10 @@ class SerialCapture:
                 continue
             if text in line:
                 return True
+            # The board serial can drop one byte around resets; initial_delay_ms
+            # is unique to the BENCH_READY line, so use it as the stable token.
+            if text == "BENCH_READY" and line.startswith("B") and "initial_delay_ms" in line:
+                return True
         return False
 
     def wait_for_attempts(self, expected_attempts: int, timeout_sec: float) -> list[dict[str, object]]:
@@ -156,13 +160,32 @@ def compose_cmd() -> list[str]:
     raise RuntimeError("Docker Compose not found")
 
 
-def run_logged(cmd: list[str], log_path: Path, *, cwd: Path = ROOT, env: dict[str, str] | None = None,
-               check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_logged(
+    cmd: list[str],
+    log_path: Path,
+    *,
+    cwd: Path = ROOT,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a") as log:
         log.write(f"$ {' '.join(cmd)}\n")
         log.flush()
-        proc = subprocess.run(cmd, cwd=cwd, env=env, text=True, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=env,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            log.write(f"[timeout] command exceeded {timeout}s\n")
+            raise
         log.write(f"[exit] {proc.returncode}\n")
     if check and proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd)
@@ -177,7 +200,8 @@ def sudo_noninteractive_hint(script: Path) -> str:
         "  sudo visudo -f /etc/sudoers.d/ipsp-benchmark\n"
         f"  thiago ALL=(root) NOPASSWD: {script}\n"
         "Then validate with:\n"
-        f"  sudo -n {script} F8:69:5E:1E:CE:2F 2"
+        f"  sudo -n {script} F9:79:AE:2A:9A:1E 2\n"
+        f"  sudo -n {script} --cleanup bt0"
     )
 
 
@@ -196,13 +220,23 @@ def check_sudo_noninteractive(args: argparse.Namespace) -> None:
         raise PermissionError(sudo_noninteractive_hint(IPSP_CONNECT_SCRIPT))
 
 
-def docker_run(args: list[str], log_path: Path, *, check: bool = True) -> subprocess.CompletedProcess[str]:
+def docker_run(
+    args: list[str],
+    log_path: Path,
+    *,
+    check: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     cmd = [*compose_cmd(), "-f", str(COMPOSE_FILE), "run", "--rm", "ipsp-benchmark", *args]
-    return run_logged(cmd, log_path, check=check)
+    return run_logged(cmd, log_path, check=check, timeout=timeout)
 
 
 def docker_rm_force(name: str, log_path: Path) -> None:
-    run_logged(["docker", "rm", "-f", name], log_path, check=False)
+    try:
+        run_logged(["docker", "rm", "-f", name], log_path, check=False, timeout=20)
+    except subprocess.TimeoutExpired:
+        with log_path.open("a") as log:
+            log.write(f"[docker] timed out removing {name}; continuing cleanup\n")
 
 
 def cleanup_host_ipsp_link(paths: CasePaths, args: argparse.Namespace) -> None:
@@ -211,16 +245,7 @@ def cleanup_host_ipsp_link(paths: CasePaths, args: argparse.Namespace) -> None:
             log.write("[cleanup] skipping bt0 cleanup without --sudo-noninteractive\n")
         return
 
-    cmd = [
-        "bash",
-        "-lc",
-        (
-            f"ip link show {args.ipsp_interface} >/dev/null 2>&1 || exit 0; "
-            f"ip link set {args.ipsp_interface} down 2>/dev/null || true; "
-            f"ip address flush dev {args.ipsp_interface} 2>/dev/null || true; "
-            f"ip -6 neigh flush dev {args.ipsp_interface} 2>/dev/null || true"
-        ),
-    ]
+    cmd = [str(IPSP_CONNECT_SCRIPT), "--cleanup", args.ipsp_interface]
     if os.geteuid() != 0:
         cmd = ["sudo", "-n", *cmd]
     run_logged(cmd, paths.docker_log, check=False)
@@ -355,12 +380,24 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]], notes: st
 
 
 def parse_attempt_line(line: str) -> dict[str, object] | None:
-    marker = "BENCH_ATTEMPT,"
-    if marker not in line:
-        return None
-    payload = line.split(marker, 1)[1].strip()
+    # Recover the exact one-byte-loss variants seen on the benchmark UART.
+    markers = (
+        "BENCH_ATTEMPT,",
+        "BENCHATTEMPT,",
+        "BENCH_ATTEPT,",
+    )
+    marker = next((candidate for candidate in markers if candidate in line), None)
+    if marker is not None:
+        payload = line.split(marker, 1)[1].strip()
+    else:
+        match = re.search(r"B[A-Z_]*ATT[A-Z_]*,", line)
+        if not match:
+            return None
+        payload = line[match.end():].strip()
     parts = payload.split(",", 8)
     if len(parts) != 9:
+        return None
+    if parts[2] not in ("success", "error", "timeout", "unsupported"):
         return None
     return {
         "attempt_index": parts[0],
@@ -418,7 +455,7 @@ def cache_case_artifacts(case: dict[str, str], paths: CasePaths) -> None:
     shutil.copytree(paths.generated, cache / "generated")
 
 
-def build_broker(case: dict[str, str], paths: CasePaths) -> Path:
+def build_broker(case: dict[str, str], paths: CasePaths) -> str:
     docker_run(
         [
             "build-broker",
@@ -431,8 +468,8 @@ def build_broker(case: dict[str, str], paths: CasePaths) -> Path:
     )
     for line in paths.build_log.read_text(errors="ignore").splitlines():
         if line.startswith("broker="):
-            return Path(line.split("=", 1)[1])
-    raise RuntimeError("Broker path was not reported by build_benchmark_broker.sh")
+            return line.split("=", 1)[1]
+    raise RuntimeError("Broker type was not reported by build_benchmark_broker.sh")
 
 
 def build_firmware(
@@ -472,8 +509,13 @@ def build_firmware(
                 f"CONFIG_APP_BENCH_ITERATIONS={iterations if iterations is not None else case['iterations']}",
                 f"CONFIG_APP_BENCH_WARMUP_ITERATIONS={warmup_iterations if warmup_iterations is not None else case['warmup_iterations']}",
                 f"CONFIG_APP_BENCH_INITIAL_DELAY_MS={int(args.initial_delay_sec * 1000)}",
+                f"CONFIG_APP_MQTT_CMD_TIMEOUT_MS={int(args.mqtt_cmd_timeout_sec * 1000)}",
+                f"CONFIG_APP_TLS_HANDSHAKE_TIMEOUT_MS={int(args.tls_handshake_timeout_sec * 1000)}",
+                f"CONFIG_APP_TLS_IO_TIMEOUT_MS={int(args.tls_io_timeout_sec * 1000)}",
+                f"CONFIG_APP_MQTT_KEEPALIVE_SEC={args.mqtt_keepalive_sec}",
                 f"CONFIG_APP_BENCH_CONNECT_RETRIES={args.connect_retries}",
                 f"CONFIG_APP_BENCH_CONNECT_RETRY_DELAY_MS={int(args.connect_retry_delay_sec * 1000)}",
+                f"CONFIG_APP_BENCH_REBOOT_AFTER_ATTEMPT={'y' if args.firmware_reboot_after_attempt and args.session_attempt_limit == 1 else 'n'}",
                 group_configs[case["kex_group"]],
                 "",
             ]
@@ -712,7 +754,7 @@ def broker_container_name(paths: CasePaths) -> str:
     return f"ipsp-benchmark-broker-{safe}"
 
 
-def start_broker(broker: Path, paths: CasePaths, args: argparse.Namespace) -> BrokerHandle:
+def start_broker(broker: str, paths: CasePaths, case: dict[str, str], args: argparse.Namespace) -> BrokerHandle:
     name = broker_container_name(paths)
     docker_rm_force(name, paths.docker_log)
     cmd = [
@@ -731,6 +773,8 @@ def start_broker(broker: Path, paths: CasePaths, args: argparse.Namespace) -> Br
         str(container_path(paths.certs / "server.crt")),
         "--key",
         str(container_path(paths.certs / "server.key")),
+        "--tls-group",
+        case["kex_group"],
         "--port",
         str(args.port),
     ]
@@ -749,9 +793,14 @@ def wait_for_broker_ready(handle: BrokerHandle, paths: CasePaths, args: argparse
     while time.time() < deadline:
         if paths.broker_log.exists():
             text = paths.broker_log.read_text(errors="ignore")
-            if "broker: listening on port" in text:
+            if (
+                "broker: listening on port" in text
+                or "Opening ipv6 listen socket on port" in text
+                or "Opening ipv4 listen socket on port" in text
+                or "mosquitto version" in text and "running" in text
+            ):
                 return
-            if "bind failed" in text or "listen (TLS) failed" in text:
+            if "bind failed" in text or "listen (TLS) failed" in text or "Address already in use" in text:
                 raise RuntimeError(f"broker failed to listen; see {paths.broker_log}")
         if handle.proc.poll() is not None:
             raise RuntimeError(f"broker exited before listening; see {paths.broker_log}")
@@ -813,17 +862,25 @@ def renumber_attempts(
 
 
 def stop_broker(handle: BrokerHandle, paths: CasePaths) -> None:
-    docker_rm_force(handle.container_name, paths.docker_log)
     handle.proc.terminate()
     try:
         handle.proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         handle.proc.kill()
+        try:
+            handle.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    docker_rm_force(handle.container_name, paths.docker_log)
 
 
 def cleanup_case_session(paths: CasePaths, args: argparse.Namespace) -> None:
     cleanup_stale_benchmark_containers(paths.docker_log)
-    docker_run(["clean-port"], paths.docker_log, check=False)
+    try:
+        docker_run(["clean-port"], paths.docker_log, check=False, timeout=20)
+    except subprocess.TimeoutExpired:
+        with paths.docker_log.open("a") as log:
+            log.write("[cleanup] clean-port timed out; continuing with host IPSP cleanup\n")
     cleanup_host_ipsp_link(paths, args)
 
 
@@ -832,12 +889,13 @@ def run_case_session(
     session_count: int,
     session_warmups: int,
     session_iterations: int,
-    broker: Path,
+    broker: str,
     paths: CasePaths,
     case: dict[str, str],
     args: argparse.Namespace,
     *,
     build_dir: Path | None,
+    flash_session: bool,
 ) -> list[dict[str, object]]:
     expected_attempts = session_warmups + session_iterations
     with paths.docker_log.open("a") as log:
@@ -848,11 +906,11 @@ def run_case_session(
 
     cleanup_case_session(paths, args)
 
-    broker_handle = start_broker(broker, paths, args)
+    broker_handle = start_broker(broker, paths, case, args)
     serial_capture: SerialCapture | None = None
     try:
         wait_for_broker_ready(broker_handle, paths, args)
-        if args.skip_flash:
+        if args.skip_flash or not flash_session:
             serial_capture = SerialCapture(start_serial(paths, args), paths)
             serial_capture.start()
             reset_device(paths, args)
@@ -875,7 +933,7 @@ def run_case_session(
                 f"see {paths.board_log}"
             )
         require_board_ping(paths, args)
-        return serial_capture.wait_for_attempts(expected_attempts, args.case_timeout_sec)
+        return serial_capture.wait_for_attempts(expected_attempts, args.session_timeout_sec)
     finally:
         if serial_capture:
             serial_capture.stop()
@@ -917,25 +975,18 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
     total_warmups = int(case["warmup_iterations"])
     total_iterations = int(case["iterations"])
     batches = attempt_batches(total_warmups, total_iterations, args.session_attempt_limit)
-    if args.skip_flash and len(batches) > 1:
-        raise ValueError(
-            "--skip-flash cannot be used with split benchmark sessions because the firmware attempt count "
-            "is compiled into the image. Re-run without --skip-flash or pass --session-attempt-limit 0."
-        )
+    build_dir = None
+    if not args.skip_flash:
+        build_dir = build_firmware(case, paths, args)
 
     attempts: list[dict[str, object]] = []
     next_attempt_index = 1
     for session_index, (session_warmups, session_iterations) in enumerate(batches, start=1):
-        if args.skip_flash:
-            build_dir = None
-        else:
-            build_dir = build_firmware(
-                case,
-                paths,
-                args,
-                iterations=session_iterations,
-                warmup_iterations=session_warmups,
-            )
+        print(
+            f"  session {session_index}/{len(batches)} "
+            f"warmups={session_warmups} iterations={session_iterations}",
+            flush=True,
+        )
         session_attempts = run_case_session(
             session_index,
             len(batches),
@@ -946,7 +997,22 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
             case,
             args,
             build_dir=build_dir,
+            flash_session=session_index == 1 and not args.skip_flash,
         )
+        if not session_attempts:
+            session_attempts = [
+                {
+                    "attempt_index": 1,
+                    "warmup": 1 if session_warmups > 0 else 0,
+                    "status": "timeout",
+                    "tcp_connect_ms": "",
+                    "tls_handshake_ms": "",
+                    "mqtt_connect_ms": "",
+                    "full_connect_ms": "",
+                    "error_code": "",
+                    "message": f"session {session_index} produced no BENCH_ATTEMPT within {args.session_timeout_sec}s",
+                }
+            ]
         attempts.extend(
             renumber_attempts(
                 session_attempts,
@@ -986,13 +1052,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--serial-baud", type=int, default=115200)
     parser.add_argument("--serial-reader", choices=("cat", "tio"), default="cat")
     parser.add_argument("--case-timeout-sec", type=int, default=900)
+    parser.add_argument("--session-timeout-sec", type=int, default=360,
+                        help="maximum time to wait for one split benchmark session to emit BENCH_ATTEMPT lines")
     parser.add_argument("--board-boot-timeout-sec", type=int, default=30)
     parser.add_argument("--board-ready-timeout-sec", type=int, default=30)
     parser.add_argument("--broker-ready-timeout-sec", type=int, default=20)
     parser.add_argument("--ipsp-ready-timeout-sec", type=int, default=20)
     parser.add_argument("--ipsp-connect-retries", type=int, default=3)
     parser.add_argument("--ipsp-reconnect-delay-sec", type=float, default=3.0)
-    parser.add_argument("--ipsp-ping-count", type=int, default=3)
+    parser.add_argument("--ipsp-ping-count", type=int, default=1)
     parser.add_argument("--ipsp-ping-timeout-sec", type=int, default=5)
     parser.add_argument("--ipsp-ping-retries", type=int, default=3)
     parser.add_argument("--ipsp-ping-retry-delay-sec", type=float, default=1.0)
@@ -1007,14 +1075,24 @@ def parse_args() -> argparse.Namespace:
                         help="reuse already flashed firmware/certs for the case and only reset the board")
     parser.add_argument("--reset-after-case", action=argparse.BooleanOptionalAction, default=True,
                         help="reset the board after each case to clear firmware/network state")
-    parser.add_argument("--session-attempt-limit", type=int, default=5,
+    parser.add_argument("--session-attempt-limit", type=int, default=1,
                         help="max warmup+measured attempts per IPSP session; 0 disables session splitting")
     parser.add_argument("--connect-retries", type=int, default=3,
                         help="firmware connection tries per BENCH_ATTEMPT")
-    parser.add_argument("--connect-retry-delay-sec", type=float, default=10.0,
+    parser.add_argument("--connect-retry-delay-sec", type=float, default=2.0,
                         help="delay between firmware connection retries")
-    parser.add_argument("--initial-delay-sec", type=float, default=30.0,
-                        help="firmware delay before the first BENCH_ATTEMPT")
+    parser.add_argument("--initial-delay-sec", type=float, default=8.0,
+                        help="firmware delay before the first BENCH_ATTEMPT; keep the default to let IPSP/IPv6 settle before measuring TCP")
+    parser.add_argument("--mqtt-cmd-timeout-sec", type=float, default=60.0,
+                        help="firmware wolfMQTT command timeout")
+    parser.add_argument("--tls-handshake-timeout-sec", type=float, default=300.0,
+                        help="firmware TLS handshake deadline; heavy PQC/RSA handshakes over IPSP can exceed a minute")
+    parser.add_argument("--tls-io-timeout-sec", type=float, default=60.0,
+                        help="per-call firmware TLS socket I/O timeout")
+    parser.add_argument("--mqtt-keepalive-sec", type=int, default=120,
+                        help="firmware MQTT keepalive; keep high for slow IPSP links")
+    parser.add_argument("--firmware-reboot-after-attempt", action=argparse.BooleanOptionalAction, default=True,
+                        help="when running one attempt per session, reboot firmware after each BENCH_ATTEMPT line")
     parser.add_argument("--port", type=int, default=8883)
     parser.add_argument("--nrfutil", default="/home/thiago/.local/bin/nrfutil")
     parser.add_argument("--ncs-version", default="v2.6.0")
