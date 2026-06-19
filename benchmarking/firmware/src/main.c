@@ -20,14 +20,16 @@
 #include <zephyr/sys/sys_heap.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/reboot.h>
+#include <zephyr/sys/time_units.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/timing/timing.h>
 
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
 #include <wolfmqtt/mqtt_client.h>
 #include <wolfmqtt/mqtt_socket.h>
 
-#include "benchmark_cert.h"
+#include <benchmark_cert.h>
 
 #define MQTT_BUFFER_SIZE 4096
 #define MQTT_CMD_TIMEOUT_MS CONFIG_APP_MQTT_CMD_TIMEOUT_MS
@@ -59,9 +61,18 @@ struct socket_context {
 
 struct bench_metrics {
 	int tcp_connect_ms;
+	int tls_setup_ms;
 	int tls_handshake_ms;
 	int mqtt_connect_ms;
 	int full_connect_ms;
+	uint64_t client_wall_cycles;
+	uint64_t client_cpu_cycles;
+	uint64_t client_cpu_ms;
+	uint32_t client_cpu_pct_x100;
+	size_t client_wolfssl_peak_bytes;
+	size_t client_wolfssl_failures;
+	size_t client_heap_current_bytes;
+	size_t client_heap_peak_bytes;
 	int error_code;
 	int tls_last_error;
 };
@@ -74,6 +85,7 @@ static struct socket_context sock_ctx = {
 	.fd = -1,
 };
 static int last_tcp_connect_ms;
+static int last_tls_setup_ms;
 
 struct wolfssl_alloc_header {
 	size_t size;
@@ -85,6 +97,15 @@ struct wolfssl_alloc_header {
 static size_t wolfssl_allocated;
 static size_t wolfssl_max_allocated;
 static size_t wolfssl_alloc_failures;
+
+#if defined(CONFIG_SYS_HEAP_RUNTIME_STATS)
+extern struct k_heap _system_heap;
+#endif
+
+struct client_runtime_snapshot {
+	uint64_t wall_cycles;
+	uint64_t cpu_cycles;
+};
 
 void *XMALLOC(size_t n, void *heap, int type)
 {
@@ -178,8 +199,6 @@ static void print_wolfssl_mem(const char *tag)
 }
 
 #if defined(CONFIG_SYS_HEAP_RUNTIME_STATS)
-extern struct k_heap _system_heap;
-
 static void print_heap_stats(const char *tag)
 {
 	struct sys_memory_stats stats;
@@ -212,6 +231,72 @@ static void print_memory_stats(const char *tag)
 	ARG_UNUSED(tag);
 }
 #endif
+
+static uint64_t runtime_cycles_to_ms(uint64_t cycles)
+{
+#if defined(CONFIG_THREAD_RUNTIME_STATS_USE_TIMING_FUNCTIONS)
+	return timing_cycles_to_ns(cycles) / 1000000U;
+#else
+	uint64_t hz = sys_clock_hw_cycles_per_sec();
+
+	return hz > 0 ? (cycles * 1000U) / hz : 0;
+#endif
+}
+
+static struct client_runtime_snapshot client_runtime_now(void)
+{
+	struct client_runtime_snapshot snapshot = { 0 };
+
+#if defined(CONFIG_SCHED_THREAD_USAGE_ALL)
+	k_thread_runtime_stats_t stats;
+
+	if (k_thread_runtime_stats_all_get(&stats) == 0) {
+		snapshot.wall_cycles = stats.execution_cycles;
+		snapshot.cpu_cycles = stats.total_cycles;
+	}
+#endif
+
+	return snapshot;
+}
+
+static void reset_attempt_resource_stats(void)
+{
+	wolfssl_max_allocated = wolfssl_allocated;
+	wolfssl_alloc_failures = 0;
+
+#if defined(CONFIG_SYS_HEAP_RUNTIME_STATS)
+	(void)sys_heap_runtime_stats_reset_max(&_system_heap.heap);
+#endif
+}
+
+static void capture_attempt_resource_stats(struct bench_metrics *metrics,
+					   struct client_runtime_snapshot start)
+{
+	struct client_runtime_snapshot end = client_runtime_now();
+	uint64_t wall_delta = end.wall_cycles >= start.wall_cycles ?
+		end.wall_cycles - start.wall_cycles : 0;
+	uint64_t cpu_delta = end.cpu_cycles >= start.cpu_cycles ?
+		end.cpu_cycles - start.cpu_cycles : 0;
+
+	metrics->client_wall_cycles = wall_delta;
+	metrics->client_cpu_cycles = cpu_delta;
+	metrics->client_cpu_ms = runtime_cycles_to_ms(cpu_delta);
+	metrics->client_cpu_pct_x100 = wall_delta > 0 ?
+		(uint32_t)((cpu_delta * 10000U) / wall_delta) : 0;
+	metrics->client_wolfssl_peak_bytes = wolfssl_max_allocated;
+	metrics->client_wolfssl_failures = wolfssl_alloc_failures;
+
+#if defined(CONFIG_SYS_HEAP_RUNTIME_STATS)
+	{
+		struct sys_memory_stats stats;
+
+		if (sys_heap_runtime_stats_get(&_system_heap.heap, &stats) == 0) {
+			metrics->client_heap_current_bytes = stats.allocated_bytes;
+			metrics->client_heap_peak_bytes = stats.max_allocated_bytes;
+		}
+	}
+#endif
+}
 
 static int set_socket_timeout(int fd, int optname, int timeout_ms)
 {
@@ -395,6 +480,7 @@ static void reset_benchmark_client_state(void)
 	memset(rx_buf, 0, sizeof(rx_buf));
 	sock_ctx.fd = -1;
 	last_tcp_connect_ms = 0;
+	last_tls_setup_ms = 0;
 }
 
 static int mqtt_message_cb(MqttClient *client, MqttMessage *message,
@@ -428,6 +514,7 @@ static int tls_setup_cb(MqttClient *client)
 	int groups[] = {
 		APP_TLS_GROUP_ID,
 	};
+	int64_t start = k_uptime_get();
 	int rc;
 
 	print_memory_stats("tls_setup_start");
@@ -436,6 +523,7 @@ static int tls_setup_cb(MqttClient *client)
 	if (!client->tls.ctx) {
 		BENCH_DEBUG("wolfSSL_CTX_new failed\n");
 		print_memory_stats("ctx_new_failed");
+		last_tls_setup_ms = (int)k_uptime_delta(&start);
 		return WOLFSSL_FAILURE;
 	}
 
@@ -443,14 +531,14 @@ static int tls_setup_cb(MqttClient *client)
 			       tls_verify_cb);
 
 	rc = wolfSSL_CTX_load_verify_buffer(client->tls.ctx,
-					    (const unsigned char *)ca_cert_pem,
-					    sizeof(ca_cert_pem) - 1,
-					    WOLFSSL_FILETYPE_PEM);
+					    ca_cert_der, ca_cert_der_len,
+					    WOLFSSL_FILETYPE_ASN1);
 	if (rc != WOLFSSL_SUCCESS) {
 		BENCH_DEBUG("wolfSSL_CTX_load_verify_buffer failed: %d\n", rc);
 		print_memory_stats("load_ca_failed");
 		wolfSSL_CTX_free(client->tls.ctx);
 		client->tls.ctx = NULL;
+		last_tls_setup_ms = (int)k_uptime_delta(&start);
 		return WOLFSSL_FAILURE;
 	}
 
@@ -460,11 +548,13 @@ static int tls_setup_cb(MqttClient *client)
 		print_memory_stats("set_groups_failed");
 		wolfSSL_CTX_free(client->tls.ctx);
 		client->tls.ctx = NULL;
+		last_tls_setup_ms = (int)k_uptime_delta(&start);
 		return WOLFSSL_FAILURE;
 	}
 
 	BENCH_DEBUG("TLS 1.3 key exchange group: %s\n", APP_TLS_GROUP_NAME);
 	print_memory_stats("tls_setup_done");
+	last_tls_setup_ms = (int)k_uptime_delta(&start);
 
 	return WOLFSSL_SUCCESS;
 }
@@ -495,6 +585,7 @@ static int mqtt_tls_net_connect(struct bench_metrics *metrics)
 			int tls_net_ms = (int)k_uptime_delta(&start);
 
 			metrics->tcp_connect_ms = last_tcp_connect_ms;
+			metrics->tls_setup_ms = last_tls_setup_ms;
 			metrics->tls_handshake_ms =
 				MAX(0, tls_net_ms - metrics->tcp_connect_ms);
 			return MQTT_CODE_SUCCESS;
@@ -585,11 +676,14 @@ static int mqtt_connect_subscribe_publish(struct bench_metrics *metrics)
 
 static int run_one_attempt(struct bench_metrics *metrics)
 {
+	struct client_runtime_snapshot runtime_start;
 	int64_t start;
 	int rc;
 
 	memset(metrics, 0, sizeof(*metrics));
 	reset_benchmark_client_state();
+	reset_attempt_resource_stats();
+	runtime_start = client_runtime_now();
 	mqtt_net_init();
 
 	rc = MqttClient_Init(&mqtt_client, &mqtt_net, mqtt_message_cb,
@@ -598,6 +692,7 @@ static int run_one_attempt(struct bench_metrics *metrics)
 	if (rc != MQTT_CODE_SUCCESS) {
 		metrics->error_code = rc;
 		reset_benchmark_client_state();
+		capture_attempt_resource_stats(metrics, runtime_start);
 		return rc;
 	}
 
@@ -613,6 +708,7 @@ static int run_one_attempt(struct bench_metrics *metrics)
 	}
 	(void)MqttClient_NetDisconnect(&mqtt_client);
 	MqttClient_DeInit(&mqtt_client);
+	capture_attempt_resource_stats(metrics, runtime_start);
 	reset_benchmark_client_state();
 	print_memory_stats(rc == MQTT_CODE_SUCCESS ? "attempt_done" : "attempt_failed");
 	return rc;
@@ -733,11 +829,13 @@ int main(void)
 
 	for (int i = 1; i <= total_attempts; i++) {
 		int warmup = i <= warmups ? 1 : 0;
-		char message[48];
+		char message[80];
 
 		rc = run_one_attempt_with_retries(i, &metrics);
 		if (rc == MQTT_CODE_SUCCESS) {
-			snprintf(message, sizeof(message), "ok");
+			snprintf(message, sizeof(message), "ok;tls_setup_ms=%d;tls_wire_ms=%d",
+				 metrics.tls_setup_ms,
+				 MAX(0, metrics.tls_handshake_ms - metrics.tls_setup_ms));
 		} else if (metrics.tls_last_error != 0) {
 			snprintf(message, sizeof(message), "tls_last_error=%d",
 				 metrics.tls_last_error);
@@ -745,7 +843,8 @@ int main(void)
 			snprintf(message, sizeof(message), "connect_failed");
 		}
 
-		BENCH_EVENT("BENCH_ATTEMPT,%d,%d,%s,%d,%d,%d,%d,%d,%s\n",
+		BENCH_EVENT("BENCH_ATTEMPT,%d,%d,%s,%d,%d,%d,%d,%d,%s,"
+			    "%llu,%llu,%llu,%u,%zu,%zu,%zu,%zu\n",
 		       i, warmup,
 		       rc == MQTT_CODE_SUCCESS ? "success" :
 		       rc == MQTT_CODE_ERROR_TIMEOUT ? "timeout" : "error",
@@ -754,7 +853,15 @@ int main(void)
 		       metrics.mqtt_connect_ms,
 		       metrics.full_connect_ms,
 		       metrics.error_code,
-		       message);
+		       message,
+		       (unsigned long long)metrics.client_wall_cycles,
+		       (unsigned long long)metrics.client_cpu_cycles,
+		       (unsigned long long)metrics.client_cpu_ms,
+		       metrics.client_cpu_pct_x100,
+		       metrics.client_wolfssl_peak_bytes,
+		       metrics.client_wolfssl_failures,
+		       metrics.client_heap_current_bytes,
+		       metrics.client_heap_peak_bytes);
 
 		if (IS_ENABLED(CONFIG_APP_BENCH_REBOOT_AFTER_ATTEMPT)) {
 			k_sleep(K_MSEC(1500));

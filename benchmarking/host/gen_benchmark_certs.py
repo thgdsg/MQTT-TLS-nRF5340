@@ -128,15 +128,24 @@ def write_server_ext(path: Path, host_ip: str, host_dns: str) -> None:
 
 
 def write_header(ca_crt: Path, header: Path) -> None:
-    pem_lines = ca_crt.read_text().splitlines()
+    ca_der = subprocess.check_output(
+        ["openssl", "x509", "-in", str(ca_crt), "-outform", "DER"]
+    )
     header.parent.mkdir(parents=True, exist_ok=True)
     with header.open("w") as fp:
         fp.write("#ifndef APP_BENCHMARK_CERT_H\n")
         fp.write("#define APP_BENCHMARK_CERT_H\n\n")
-        fp.write("static const char ca_cert_pem[] =\n")
-        for line in pem_lines:
-            fp.write(f"\"{line}\\n\"\n")
-        fp.write(";\n\n#endif\n")
+        fp.write("static const unsigned char ca_cert_der[] = {\n")
+        for offset in range(0, len(ca_der), 12):
+            chunk = ca_der[offset:offset + 12]
+            fp.write("    ")
+            fp.write(", ".join(f"0x{byte:02x}" for byte in chunk))
+            if offset + 12 < len(ca_der):
+                fp.write(",")
+            fp.write("\n")
+        fp.write("};\n")
+        fp.write("static const unsigned int ca_cert_der_len = sizeof(ca_cert_der);\n\n")
+        fp.write("#endif\n")
 
 
 def parse_args() -> argparse.Namespace:

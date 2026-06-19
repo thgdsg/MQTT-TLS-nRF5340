@@ -33,8 +33,14 @@ INPUT_FIELDS = [
     "enabled",
     "kex_group",
     "kex_nist_level",
+    "kex_public_key_bytes",
+    "kex_ciphertext_bytes",
+    "kex_shared_secret_bytes",
     "cert_sig_alg",
     "sig_nist_level",
+    "sig_public_key_bytes",
+    "sig_private_key_bytes",
+    "sig_signature_bytes",
     "iterations",
     "warmup_iterations",
     "expected_support",
@@ -51,12 +57,28 @@ ATTEMPT_FIELDS = [
     "full_connect_ms",
     "error_code",
     "message",
+    "client_wall_cycles",
+    "client_cpu_cycles",
+    "client_cpu_ms",
+    "client_cpu_pct_x100",
+    "client_wolfssl_peak_bytes",
+    "client_wolfssl_failures",
+    "client_heap_current_bytes",
+    "client_heap_peak_bytes",
 ]
 
 SUMMARY_FIELDS = [
     "case_id",
     "kex_group",
+    "kex_nist_level",
+    "kex_public_key_bytes",
+    "kex_ciphertext_bytes",
+    "kex_shared_secret_bytes",
     "cert_sig_alg",
+    "sig_nist_level",
+    "sig_public_key_bytes",
+    "sig_private_key_bytes",
+    "sig_signature_bytes",
     "status",
     "success_count",
     "fail_count",
@@ -70,7 +92,24 @@ SUMMARY_FIELDS = [
     "handshake_throughput_hps",
     "mean_full_connect_ms",
     "connections_per_second",
+    "mean_client_cpu_ms",
+    "mean_client_cpu_pct",
+    "max_client_wolfssl_peak_bytes",
+    "max_client_wolfssl_failures",
+    "max_client_heap_current_bytes",
+    "max_client_heap_peak_bytes",
     "notes",
+]
+
+ATTEMPT_RESOURCE_FIELDS = [
+    "client_wall_cycles",
+    "client_cpu_cycles",
+    "client_cpu_ms",
+    "client_cpu_pct_x100",
+    "client_wolfssl_peak_bytes",
+    "client_wolfssl_failures",
+    "client_heap_current_bytes",
+    "client_heap_peak_bytes",
 ]
 
 
@@ -277,10 +316,59 @@ def container_path(path: Path) -> Path:
 
 def read_cases(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as fp:
-        rows = list(csv.DictReader(fp))
-    missing = [field for field in INPUT_FIELDS if field not in (rows[0].keys() if rows else [])]
+        reader = csv.DictReader(fp)
+        rows = list(reader)
+    required = [
+        "case_id",
+        "enabled",
+        "kex_group",
+        "kex_nist_level",
+        "cert_sig_alg",
+        "sig_nist_level",
+        "iterations",
+        "warmup_iterations",
+        "expected_support",
+        "notes",
+    ]
+    missing = [field for field in required if field not in (rows[0].keys() if rows else [])]
     if missing:
         raise ValueError(f"Input CSV missing fields: {', '.join(missing)}")
+
+    old_fields = [
+        "case_id",
+        "enabled",
+        "kex_group",
+        "kex_nist_level",
+        "cert_sig_alg",
+        "sig_nist_level",
+        "iterations",
+        "warmup_iterations",
+        "expected_support",
+        "notes",
+    ]
+    if reader.fieldnames == old_fields:
+        normalized_rows = []
+        for row in rows:
+            extra = row.pop(None, None)
+            if extra:
+                values = [row.get(field, "") for field in old_fields] + extra
+                if len(values) == len(INPUT_FIELDS):
+                    row = dict(zip(INPUT_FIELDS, values))
+                else:
+                    raise ValueError(
+                        f"Input CSV row has {len(values)} columns but expected "
+                        f"{len(old_fields)} legacy columns or {len(INPUT_FIELDS)} current columns: "
+                        f"{row.get('case_id', '<unknown>')}"
+                    )
+            normalized_rows.append(row)
+        rows = normalized_rows
+    elif any(None in row for row in rows):
+        bad_case = next((row.get("case_id", "<unknown>") for row in rows if None in row), "<unknown>")
+        raise ValueError(
+            f"Input CSV has extra columns not present in the header near case {bad_case}. "
+            "Regenerate it with benchmarking/generate_cases.py."
+        )
+
     return [row for row in rows if row.get("enabled", "1") == "1"]
 
 
@@ -319,19 +407,19 @@ def case_paths(run_dir: Path, sequence: int, case_id: str) -> CasePaths:
 
 
 def unsupported_attempt(message: str) -> list[dict[str, object]]:
-    return [
-        {
-            "attempt_index": 0,
-            "warmup": 0,
-            "status": "unsupported",
-            "tcp_connect_ms": "",
-            "tls_handshake_ms": "",
-            "mqtt_connect_ms": "",
-            "full_connect_ms": "",
-            "error_code": "",
-            "message": message,
-        }
-    ]
+    row = {
+        "attempt_index": 0,
+        "warmup": 0,
+        "status": "unsupported",
+        "tcp_connect_ms": "",
+        "tls_handshake_ms": "",
+        "mqtt_connect_ms": "",
+        "full_connect_ms": "",
+        "error_code": "",
+        "message": message,
+    }
+    row.update({field: "" for field in ATTEMPT_RESOURCE_FIELDS})
+    return [row]
 
 
 def summarize(case: dict[str, str], attempts: list[dict[str, object]], notes: str = "") -> dict[str, object]:
@@ -343,6 +431,14 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]], notes: st
 
     handshake = [float(a["tls_handshake_ms"]) for a in successes if str(a.get("tls_handshake_ms", "")) != ""]
     full = [float(a["full_connect_ms"]) for a in successes if str(a.get("full_connect_ms", "")) != ""]
+
+    def numeric_attempt_values(field: str) -> list[float]:
+        values: list[float] = []
+        for attempt in successes:
+            raw = str(attempt.get(field, ""))
+            if raw != "":
+                values.append(float(raw))
+        return values
 
     def p95(values: list[float]) -> str:
         if not values:
@@ -357,11 +453,25 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]], notes: st
 
     mean_handshake = statistics.mean(handshake) if handshake else None
     mean_full = statistics.mean(full) if full else None
+    client_cpu_ms = numeric_attempt_values("client_cpu_ms")
+    client_cpu_pct = [value / 100.0 for value in numeric_attempt_values("client_cpu_pct_x100")]
+    client_wolfssl_peak = numeric_attempt_values("client_wolfssl_peak_bytes")
+    client_wolfssl_failures = numeric_attempt_values("client_wolfssl_failures")
+    client_heap_current = numeric_attempt_values("client_heap_current_bytes")
+    client_heap_peak = numeric_attempt_values("client_heap_peak_bytes")
 
     return {
         "case_id": case["case_id"],
         "kex_group": case["kex_group"],
+        "kex_nist_level": case.get("kex_nist_level", ""),
+        "kex_public_key_bytes": case.get("kex_public_key_bytes", ""),
+        "kex_ciphertext_bytes": case.get("kex_ciphertext_bytes", ""),
+        "kex_shared_secret_bytes": case.get("kex_shared_secret_bytes", ""),
         "cert_sig_alg": case["cert_sig_alg"],
+        "sig_nist_level": case.get("sig_nist_level", ""),
+        "sig_public_key_bytes": case.get("sig_public_key_bytes", ""),
+        "sig_private_key_bytes": case.get("sig_private_key_bytes", ""),
+        "sig_signature_bytes": case.get("sig_signature_bytes", ""),
         "status": status,
         "success_count": len(successes),
         "fail_count": len(failures),
@@ -375,6 +485,12 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]], notes: st
         "handshake_throughput_hps": f"{1000.0 / mean_handshake:.6f}" if mean_handshake else "",
         "mean_full_connect_ms": f"{mean_full:.3f}" if mean_full is not None else "",
         "connections_per_second": f"{1000.0 / mean_full:.6f}" if mean_full else "",
+        "mean_client_cpu_ms": f"{statistics.mean(client_cpu_ms):.3f}" if client_cpu_ms else "",
+        "mean_client_cpu_pct": f"{statistics.mean(client_cpu_pct):.3f}" if client_cpu_pct else "",
+        "max_client_wolfssl_peak_bytes": f"{max(client_wolfssl_peak):.0f}" if client_wolfssl_peak else "",
+        "max_client_wolfssl_failures": f"{max(client_wolfssl_failures):.0f}" if client_wolfssl_failures else "",
+        "max_client_heap_current_bytes": f"{max(client_heap_current):.0f}" if client_heap_current else "",
+        "max_client_heap_peak_bytes": f"{max(client_heap_peak):.0f}" if client_heap_peak else "",
         "notes": notes or case.get("notes", ""),
     }
 
@@ -394,12 +510,12 @@ def parse_attempt_line(line: str) -> dict[str, object] | None:
         if not match:
             return None
         payload = line[match.end():].strip()
-    parts = payload.split(",", 8)
-    if len(parts) != 9:
+    parts = payload.split(",")
+    if len(parts) < 9:
         return None
     if parts[2] not in ("success", "error", "timeout", "unsupported"):
         return None
-    return {
+    row = {
         "attempt_index": parts[0],
         "warmup": parts[1],
         "status": parts[2],
@@ -410,6 +526,9 @@ def parse_attempt_line(line: str) -> dict[str, object] | None:
         "error_code": parts[7],
         "message": parts[8],
     }
+    for index, field in enumerate(ATTEMPT_RESOURCE_FIELDS, start=9):
+        row[field] = parts[index] if index < len(parts) else ""
+    return row
 
 
 def generate_certs(case: dict[str, str], paths: CasePaths) -> bool:

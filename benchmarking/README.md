@@ -16,6 +16,8 @@ Initial metrics:
 - TLS handshake time and derived handshake throughput.
 - Full TCP + TLS + MQTT connect time.
 - Connections per second.
+- Key size metadata for each key exchange and certificate signature algorithm.
+- Client-side CPU usage and memory peaks collected by the nRF52840 firmware.
 - Success, failure, timeout, and unsupported counts.
 
 ML-KEM is tested as the TLS 1.3 key exchange group. ECDHE P-256/P-384/P-521 are
@@ -168,6 +170,11 @@ The firmware also prints `heap[...]` and `wolfssl_mem[...]` lines around TLS
 setup, failures, and attempt cleanup. If a case stops after repeated retries,
 check whether `wolfssl_mem[attempt_failed]` returns to `current=0` and whether
 `failures` increased.
+
+Measured attempts also include CSV columns for board-side resource usage:
+`client_cpu_ms`, `client_cpu_pct_x100`, `client_wolfssl_peak_bytes`,
+`client_wolfssl_failures`, `client_heap_current_bytes`, and
+`client_heap_peak_bytes`.
 
 ## Results
 

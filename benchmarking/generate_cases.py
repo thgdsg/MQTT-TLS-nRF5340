@@ -20,38 +20,44 @@ CASES_DIR = ROOT / "cases"
 class KemCase:
     name: str
     nist_level: int
+    public_key_bytes: int
+    ciphertext_bytes: int
+    shared_secret_bytes: int
 
 
 @dataclass(frozen=True)
 class SigCase:
     name: str
     nist_level: int
+    public_key_bytes: int
+    private_key_bytes: int
+    signature_bytes: int
     expected_support: str = "probe"
     notes: str = ""
 
 
 KEMS = [
-    KemCase("MLKEM512", 1),
-    KemCase("MLKEM768", 3),
-    KemCase("MLKEM1024", 5),
-    KemCase("ECDHE-P-256", 1),
-    KemCase("ECDHE-P-384", 3),
-    KemCase("ECDHE-P-521", 5),
+    KemCase("MLKEM512", 1, 800, 768, 32),
+    KemCase("MLKEM768", 3, 1184, 1088, 32),
+    KemCase("MLKEM1024", 5, 1568, 1568, 32),
+    KemCase("ECDHE-P-256", 1, 65, 65, 32),
+    KemCase("ECDHE-P-384", 3, 97, 97, 48),
+    KemCase("ECDHE-P-521", 5, 133, 133, 66),
 ]
 
 SIGS = [
-    SigCase("ML-DSA-44", 2),
-    SigCase("ML-DSA-65", 3),
-    SigCase("ML-DSA-87", 5),
-    SigCase("SLH-DSA-SHAKE-128s", 1),
-    SigCase("SLH-DSA-SHAKE-192s", 3),
-    SigCase("SLH-DSA-SHAKE-256s", 5),
-    SigCase("ECDSA-P-256", 1, "required", "classic approximate NIST level 1"),
-    SigCase("ECDSA-P-384", 3, "required", "classic approximate NIST level 3"),
-    SigCase("ECDSA-P-521", 5, "required", "classic approximate NIST level 5"),
-    SigCase("RSA-PSS-3072", 1, "required", "classic approximate NIST level 1"),
-    SigCase("RSA-PSS-7680", 3, "required", "classic approximate NIST level 3"),
-    SigCase("RSA-PSS-15360", 5, "required", "classic approximate NIST level 5"),
+    SigCase("ML-DSA-44", 2, 1312, 2560, 2420),
+    SigCase("ML-DSA-65", 3, 1952, 4032, 3309),
+    SigCase("ML-DSA-87", 5, 2592, 4896, 4627),
+    SigCase("SLH-DSA-SHAKE-128s", 1, 32, 64, 7856),
+    SigCase("SLH-DSA-SHAKE-192s", 3, 48, 96, 16224),
+    SigCase("SLH-DSA-SHAKE-256s", 5, 64, 128, 29792),
+    SigCase("ECDSA-P-256", 1, 65, 32, 64, "required", "classic approximate NIST level 1"),
+    SigCase("ECDSA-P-384", 3, 97, 48, 96, "required", "classic approximate NIST level 3"),
+    SigCase("ECDSA-P-521", 5, 133, 66, 132, "required", "classic approximate NIST level 5"),
+    SigCase("RSA-PSS-3072", 1, 384, 384, 384, "required", "classic approximate NIST level 1"),
+    SigCase("RSA-PSS-7680", 3, 960, 960, 960, "required", "classic approximate NIST level 3"),
+    SigCase("RSA-PSS-15360", 5, 1920, 1920, 1920, "required", "classic approximate NIST level 5"),
 ]
 
 FIELDNAMES = [
@@ -59,8 +65,14 @@ FIELDNAMES = [
     "enabled",
     "kex_group",
     "kex_nist_level",
+    "kex_public_key_bytes",
+    "kex_ciphertext_bytes",
+    "kex_shared_secret_bytes",
     "cert_sig_alg",
     "sig_nist_level",
+    "sig_public_key_bytes",
+    "sig_private_key_bytes",
+    "sig_signature_bytes",
     "iterations",
     "warmup_iterations",
     "expected_support",
@@ -83,8 +95,14 @@ def build_cases(iterations: int, warmup_iterations: int) -> list[dict[str, str]]
                     "enabled": "1",
                     "kex_group": kem.name,
                     "kex_nist_level": str(kem.nist_level),
+                    "kex_public_key_bytes": str(kem.public_key_bytes),
+                    "kex_ciphertext_bytes": str(kem.ciphertext_bytes),
+                    "kex_shared_secret_bytes": str(kem.shared_secret_bytes),
                     "cert_sig_alg": sig.name,
                     "sig_nist_level": str(sig.nist_level),
+                    "sig_public_key_bytes": str(sig.public_key_bytes),
+                    "sig_private_key_bytes": str(sig.private_key_bytes),
+                    "sig_signature_bytes": str(sig.signature_bytes),
                     "iterations": str(iterations),
                     "warmup_iterations": str(warmup_iterations),
                     "expected_support": sig.expected_support,
