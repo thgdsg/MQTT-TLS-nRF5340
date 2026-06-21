@@ -127,24 +127,38 @@ def write_server_ext(path: Path, host_ip: str, host_dns: str) -> None:
     )
 
 
+def cert_der(ca_crt: Path) -> bytes:
+    return subprocess.check_output(["openssl", "x509", "-in", str(ca_crt), "-outform", "DER"])
+
+
+def write_der_array(fp, name: str, der: bytes) -> None:
+    fp.write(f"static const unsigned char {name}[] = {{\n")
+    for offset in range(0, len(der), 12):
+        chunk = der[offset:offset + 12]
+        fp.write("    ")
+        fp.write(", ".join(f"0x{byte:02x}" for byte in chunk))
+        if offset + 12 < len(der):
+            fp.write(",")
+        fp.write("\n")
+    fp.write("};\n")
+
+
 def write_header(ca_crt: Path, header: Path) -> None:
-    ca_der = subprocess.check_output(
-        ["openssl", "x509", "-in", str(ca_crt), "-outform", "DER"]
-    )
+    ca_der = cert_der(ca_crt)
     header.parent.mkdir(parents=True, exist_ok=True)
     with header.open("w") as fp:
         fp.write("#ifndef APP_BENCHMARK_CERT_H\n")
         fp.write("#define APP_BENCHMARK_CERT_H\n\n")
-        fp.write("static const unsigned char ca_cert_der[] = {\n")
-        for offset in range(0, len(ca_der), 12):
-            chunk = ca_der[offset:offset + 12]
-            fp.write("    ")
-            fp.write(", ".join(f"0x{byte:02x}" for byte in chunk))
-            if offset + 12 < len(ca_der):
-                fp.write(",")
-            fp.write("\n")
+        fp.write("struct benchmark_ca_cert {\n")
+        fp.write("    const unsigned char *der;\n")
+        fp.write("    unsigned int len;\n")
+        fp.write("    const char *name;\n")
+        fp.write("};\n\n")
+        write_der_array(fp, "ca_cert_der_0", ca_der)
+        fp.write("static const struct benchmark_ca_cert benchmark_ca_certs[] = {\n")
+        fp.write("    { ca_cert_der_0, sizeof(ca_cert_der_0), \"default\" },\n")
         fp.write("};\n")
-        fp.write("static const unsigned int ca_cert_der_len = sizeof(ca_cert_der);\n\n")
+        fp.write("static const unsigned int benchmark_ca_cert_count = 1;\n\n")
         fp.write("#endif\n")
 
 

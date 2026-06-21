@@ -51,14 +51,25 @@ exchange group enabled:
 - `ECDHE-P-256`, `ECDHE-P-384`, `ECDHE-P-521`
 
 The board advertises this full list and the benchmark server selects the
-per-case KEM through its OpenSSL/Mosquitto configuration. This means cases that
-only change `kex_group` but keep the same `cert_sig_alg` can reuse the same
-flashed firmware image; the runner resets the board and starts a new broker
-instead of flashing again.
+per-case KEM through its OpenSSL/Mosquitto configuration.
 
-Certificate/signature algorithms are still embedded through the generated
-firmware trust anchor. Changing `cert_sig_alg` can still require a new firmware
-image until a full CA bundle mode is added.
+## Universal CA Bundle
+
+By default, the runner also builds a firmware CA bundle containing the trust
+anchors for every `cert_sig_alg` selected in the current run. This lets the same
+flashed firmware validate server certificates signed with different algorithms,
+for example `ECDSA-P-256`, `ML-DSA-44`, and `SLH-DSA-SHAKE-256s`.
+
+Together, universal KEM firmware and the universal CA bundle mean the runner
+only rebuilds/reflashes when the firmware profile changes, not when a case only
+changes `kex_group` or `cert_sig_alg`. Per-case server certificates and keys are
+still swapped on the Mosquitto/OpenSSL side.
+
+To return to the older one-CA-per-firmware behavior, add:
+
+```bash
+--no-universal-ca-bundle
+```
 
 To return to the older one-KEM-per-firmware behavior, add:
 
@@ -166,17 +177,22 @@ python benchmarking/run_benchmarks.py \
 The runner will:
 
 1. Generate certificates under `benchmarking/results/<run_id>/cases/...`.
-   With universal KEM firmware enabled, certificate artifacts are cached per
-   `cert_sig_alg` and reused across KEM variants.
+   Certificate artifacts are cached per `cert_sig_alg` and reused across KEM
+   variants. With universal CA bundle enabled, the runner also writes a single
+   generated `benchmark_cert.h` containing every CA needed by the current run.
 2. Validate the Mosquitto/OpenSSL/OQS broker environment.
 3. Build the benchmark firmware in `benchmarking/work/firmware-build/`.
-   With universal KEM firmware enabled, the build cache key ignores
-   `kex_group`, so changing only the KEM does not rebuild the board firmware.
+   With universal KEM firmware and universal CA bundle enabled, the build cache
+   key ignores `kex_group` and individual `cert_sig_alg` changes covered by the
+   same bundle.
 4. Flash the board with `nrfutil` only when the firmware profile changed.
-5. Reconnect IPSP using the existing `host/ipsp_connect.sh`.
-6. Start Mosquitto in Docker with a per-case OpenSSL config that sets the TLS
+5. Build a global, seed-driven session schedule. By default each case's full
+   session plan is repeated twice and all sessions are shuffled together, so a
+   case can run, another case can run, and then the first case can be revisited.
+6. Reconnect IPSP using the existing `host/ipsp_connect.sh`.
+7. Start Mosquitto in Docker with a per-case OpenSSL config that sets the TLS
    group, for example `Groups = MLKEM512`.
-7. Parse serial `BENCH_ATTEMPT` lines and write CSV output.
+8. Parse serial `BENCH_ATTEMPT` lines and write CSV output.
 
 The default benchmark target is now `nrf52840dk_nrf52840`, using nRF52
 single-core flashing through `nrfutil`. To run the same benchmark on the older
@@ -225,10 +241,14 @@ Useful hardware-run options:
 - `--universal-kem-firmware` / `--no-universal-kem-firmware`: keep one flashed
   firmware image for all KEMs that share the same certificate/signature
   algorithm, or return to the older one-KEM-per-firmware mode.
+- `--universal-ca-bundle` / `--no-universal-ca-bundle`: keep one flashed
+  firmware image for all certificate/signature algorithms included in the
+  current run, or return to the older one-CA-per-firmware mode.
+- `--sessions-per-case 2`: repeat each case's full session plan this many
+  times. Sessions from all cases are shuffled together using the run seed.
 - `--skip-flash`: do not program the board again; the runner only resets it.
-  With universal KEM firmware enabled, this requires cached cert artifacts for
-  the same `cert_sig_alg`; with `--no-universal-kem-firmware`, it requires the
-  same `case_id`.
+  With universal CA bundle enabled, this requires cached cert artifacts for the
+  selected `cert_sig_alg` values and a compatible firmware already flashed.
 - `--reset-after-case` / `--no-reset-after-case`: reset the board after each
   case by default, clearing firmware-side network/TLS state before the next
   cryptographic combination.
@@ -269,6 +289,7 @@ benchmarking/results/<run_id>/
   seed.txt
   input_cases.csv
   run_manifest.csv
+  session_manifest.csv
   summary.csv
   cases/<sequence>_<case_id>/attempts.csv
   cases/<sequence>_<case_id>/*.log

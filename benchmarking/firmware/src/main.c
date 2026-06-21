@@ -598,16 +598,20 @@ static int tls_setup_cb(MqttClient *client)
 	wolfSSL_CTX_set_verify(client->tls.ctx, WOLFSSL_VERIFY_PEER,
 			       tls_verify_cb);
 
-	rc = wolfSSL_CTX_load_verify_buffer(client->tls.ctx,
-					    ca_cert_der, ca_cert_der_len,
-					    WOLFSSL_FILETYPE_ASN1);
-	if (rc != WOLFSSL_SUCCESS) {
-		BENCH_DEBUG("wolfSSL_CTX_load_verify_buffer failed: %d\n", rc);
-		print_memory_stats("load_ca_failed");
-		wolfSSL_CTX_free(client->tls.ctx);
-		client->tls.ctx = NULL;
-		last_tls_setup_ms = (int)k_uptime_delta(&start);
-		return WOLFSSL_FAILURE;
+	for (unsigned int i = 0; i < benchmark_ca_cert_count; i++) {
+		rc = wolfSSL_CTX_load_verify_buffer(client->tls.ctx,
+						    benchmark_ca_certs[i].der,
+						    benchmark_ca_certs[i].len,
+						    WOLFSSL_FILETYPE_ASN1);
+		if (rc != WOLFSSL_SUCCESS) {
+			BENCH_DEBUG("wolfSSL_CTX_load_verify_buffer[%u:%s] failed: %d\n",
+				    i, benchmark_ca_certs[i].name, rc);
+			print_memory_stats("load_ca_failed");
+			wolfSSL_CTX_free(client->tls.ctx);
+			client->tls.ctx = NULL;
+			last_tls_setup_ms = (int)k_uptime_delta(&start);
+			return WOLFSSL_FAILURE;
+		}
 	}
 
 	rc = wolfSSL_CTX_set_groups(client->tls.ctx, groups, ARRAY_SIZE(groups));

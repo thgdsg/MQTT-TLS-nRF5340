@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import os
 import random
 import queue
 import re
 import shutil
+import ssl
 import statistics
 import subprocess
 import sys
@@ -149,6 +151,31 @@ class CasePaths:
 class BrokerHandle:
     proc: subprocess.Popen[str]
     container_name: str
+
+
+@dataclass
+class PreparedCase:
+    sequence: int
+    case: dict[str, str]
+    paths: CasePaths
+    broker: str
+    batches: list[tuple[int, int]]
+    build_dir: Path | None
+    firmware_key: str
+    attempts: list[dict[str, object]]
+    next_attempt_index: int = 1
+
+
+@dataclass
+class SessionJob:
+    session_sequence: int
+    case_sequence: int
+    case_id: str
+    repeat_index: int
+    batch_index: int
+    batch_count: int
+    session_warmups: int
+    session_iterations: int
 
 
 class SerialCapture:
@@ -481,6 +508,10 @@ def slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
 
 
+def short_hash(value: str, length: int = 12) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
+
+
 def universal_kem_enabled(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "universal_kem_firmware", True))
 
@@ -507,14 +538,15 @@ def firmware_profile_key(
     warmup_iterations: int | None = None,
 ) -> str:
     kex_part = "universal-kem" if universal_kem_enabled(args) else slug(case["kex_group"])
+    cert_part = getattr(args, "_ca_bundle_key", None) if universal_ca_bundle_enabled(args) else f"cert_{slug(case['cert_sig_alg'])}"
     iter_part = iterations if iterations is not None else case["iterations"]
     warmup_part = warmup_iterations if warmup_iterations is not None else case["warmup_iterations"]
     verbose_part = "verbose" if args.firmware_verbose_logs else "quiet"
     reboot_part = "reboot" if args.firmware_reboot_after_attempt else "no-reboot"
-    return "__".join(
+    full_key = "__".join(
         [
             kex_part,
-            f"cert_{slug(case['cert_sig_alg'])}",
+            str(cert_part),
             f"mlkem_{slug(args.mlkem_backend)}",
             f"iter_{iter_part}",
             f"warmup_{warmup_part}",
@@ -527,6 +559,8 @@ def firmware_profile_key(
             verbose_part,
         ]
     )
+    readable_prefix = "__".join([kex_part, str(cert_part), f"mlkem_{slug(args.mlkem_backend)}"])
+    return f"{readable_prefix}__{short_hash(full_key)}"
 
 
 def unsupported_attempt(message: str) -> list[dict[str, object]]:
@@ -694,6 +728,52 @@ def parse_attempt_line(line: str) -> dict[str, object] | None:
     return row
 
 
+def universal_ca_bundle_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "universal_ca_bundle", True))
+
+
+def ca_bundle_key(rows: list[dict[str, str]]) -> str:
+    sigs = sorted({row["cert_sig_alg"] for row in rows if row.get("enabled", "1") == "1"})
+    full = "__".join(sigs)
+    return f"ca_bundle__{len(sigs)}algs__{short_hash(full)}"
+
+
+def der_bytes_from_pem_cert(path: Path) -> bytes:
+    pem = path.read_text()
+    return ssl.PEM_cert_to_DER_cert(pem)
+
+
+def write_ca_bundle_header(ca_entries: list[tuple[str, Path]], header: Path) -> None:
+    header.parent.mkdir(parents=True, exist_ok=True)
+    with header.open("w") as fp:
+        fp.write("#ifndef APP_BENCHMARK_CERT_H\n")
+        fp.write("#define APP_BENCHMARK_CERT_H\n\n")
+        fp.write("struct benchmark_ca_cert {\n")
+        fp.write("    const unsigned char *der;\n")
+        fp.write("    unsigned int len;\n")
+        fp.write("    const char *name;\n")
+        fp.write("};\n\n")
+
+        for index, (_, ca_crt) in enumerate(ca_entries):
+            der = der_bytes_from_pem_cert(ca_crt)
+            fp.write(f"static const unsigned char ca_cert_der_{index}[] = {{\n")
+            for offset in range(0, len(der), 12):
+                chunk = der[offset:offset + 12]
+                fp.write("    ")
+                fp.write(", ".join(f"0x{byte:02x}" for byte in chunk))
+                if offset + 12 < len(der):
+                    fp.write(",")
+                fp.write("\n")
+            fp.write("};\n")
+
+        fp.write("static const struct benchmark_ca_cert benchmark_ca_certs[] = {\n")
+        for index, (name, _) in enumerate(ca_entries):
+            fp.write(f"    {{ ca_cert_der_{index}, sizeof(ca_cert_der_{index}), \"{name}\" }},\n")
+        fp.write("};\n")
+        fp.write(f"static const unsigned int benchmark_ca_cert_count = {len(ca_entries)};\n\n")
+        fp.write("#endif\n")
+
+
 def generate_certs(case: dict[str, str], paths: CasePaths) -> bool:
     proc = docker_run(
         [
@@ -735,6 +815,74 @@ def cache_case_artifacts(case: dict[str, str], paths: CasePaths, args: argparse.
         shutil.rmtree(cache)
     shutil.copytree(paths.certs, cache / "certs")
     shutil.copytree(paths.generated, cache / "generated")
+
+
+def cached_cert_artifacts_exist(case: dict[str, str], args: argparse.Namespace) -> bool:
+    cache = case_artifact_cache(case, args)
+    return (
+        (cache / "certs" / "ca.crt").exists()
+        and (cache / "certs" / "server.crt").exists()
+        and (cache / "certs" / "server.key").exists()
+    )
+
+
+def ensure_cached_cert_artifacts(case: dict[str, str], args: argparse.Namespace, log_path: Path) -> None:
+    if cached_cert_artifacts_exist(case, args):
+        return
+
+    scratch_root = WORK_DIR / "universal-ca-build" / cert_artifact_cache_key(case, args)
+    if scratch_root.exists():
+        shutil.rmtree(scratch_root)
+    scratch_paths = CasePaths(
+        root=scratch_root,
+        certs=scratch_root / "certs",
+        generated=scratch_root / "generated",
+        attempts_csv=scratch_root / "attempts.csv",
+        board_log=scratch_root / "board.log",
+        broker_log=scratch_root / "broker.log",
+        build_log=scratch_root / "build.log",
+        flash_log=scratch_root / "flash.log",
+        docker_log=log_path,
+    )
+    if not generate_certs(cert_generation_case(case, args), scratch_paths):
+        raise RuntimeError(f"certificate generation unsupported for {case['cert_sig_alg']}")
+    cache_case_artifacts(case, scratch_paths, args)
+
+
+def prepare_universal_ca_bundle(rows: list[dict[str, str]], run_dir: Path, args: argparse.Namespace) -> None:
+    if not universal_ca_bundle_enabled(args):
+        return
+
+    sig_to_case: dict[str, dict[str, str]] = {}
+    for row in rows:
+        sig_to_case.setdefault(row["cert_sig_alg"], row)
+
+    for case in sig_to_case.values():
+        ensure_cached_cert_artifacts(case, args, run_dir / "docker.log")
+
+    entries: list[tuple[str, Path]] = []
+    for sig in sorted(sig_to_case):
+        cache = case_artifact_cache(sig_to_case[sig], args)
+        ca_crt = cache / "certs" / "ca.crt"
+        if not ca_crt.exists():
+            raise FileNotFoundError(f"cached CA certificate missing for {sig}: {ca_crt}")
+        entries.append((sig, ca_crt))
+
+    bundle_dir = WORK_DIR / "generated" / ca_bundle_key(rows)
+    write_ca_bundle_header(entries, bundle_dir / "benchmark_cert.h")
+    (bundle_dir / "manifest.txt").write_text(
+        "\n".join([name for name, _ in entries]) + "\n"
+    )
+    args._ca_bundle_header = str(bundle_dir / "benchmark_cert.h")
+    args._ca_bundle_key = ca_bundle_key(rows)
+
+
+def install_case_trust_header(paths: CasePaths, args: argparse.Namespace) -> None:
+    if not universal_ca_bundle_enabled(args):
+        return
+    bundle_header = Path(args._ca_bundle_header)
+    paths.generated.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(bundle_header, paths.generated / "benchmark_cert.h")
 
 
 def build_broker(case: dict[str, str], paths: CasePaths) -> str:
@@ -1180,6 +1328,24 @@ def renumber_attempts(
     return renumbered
 
 
+def renumber_session_attempts(
+    attempts: list[dict[str, object]],
+    *,
+    start_index: int,
+    session_warmups: int,
+) -> list[dict[str, object]]:
+    renumbered: list[dict[str, object]] = []
+    for offset, attempt in enumerate(attempts, start=0):
+        renumbered.append(
+            {
+                **attempt,
+                "attempt_index": start_index + offset,
+                "warmup": 1 if offset < session_warmups else 0,
+            }
+        )
+    return renumbered
+
+
 def stop_broker(handle: BrokerHandle, paths: CasePaths) -> None:
     handle.proc.terminate()
     try:
@@ -1262,6 +1428,215 @@ def run_case_session(
             reset_device(paths, args)
 
 
+def prepare_case_for_schedule(
+    sequence: int,
+    case: dict[str, str],
+    run_dir: Path,
+    args: argparse.Namespace,
+) -> PreparedCase | dict[str, object]:
+    paths = case_paths(run_dir, sequence, case["case_id"])
+    paths.root.mkdir(parents=True, exist_ok=False)
+
+    if case.get("expected_support") == "known_unsupported":
+        attempts = attach_attempt_case_metadata(
+            case,
+            unsupported_attempt(case.get("notes", "known unsupported")),
+        )
+        write_csv(paths.attempts_csv, ATTEMPT_FIELDS, attempts)
+        return summarize(case, attempts)
+
+    if args.dry_run:
+        attempts = attach_attempt_case_metadata(case, unsupported_attempt("dry-run: not executed"))
+        write_csv(paths.attempts_csv, ATTEMPT_FIELDS, attempts)
+        return summarize(case, attempts, "dry-run")
+
+    if args.skip_flash:
+        if not restore_cached_case_artifacts(case, paths, args):
+            raise FileNotFoundError(
+                f"--skip-flash requires cached certs for {cert_artifact_cache_key(case, args)} under "
+                f"{case_artifact_cache(case, args)}. Run a compatible case once without --skip-flash first."
+            )
+    else:
+        if not restore_cached_case_artifacts(case, paths, args):
+            if not generate_certs(cert_generation_case(case, args), paths):
+                attempts = attach_attempt_case_metadata(
+                    case,
+                    unsupported_attempt("certificate generation unsupported"),
+                )
+                write_csv(paths.attempts_csv, ATTEMPT_FIELDS, attempts)
+                return summarize(case, attempts, "certificate generation unsupported")
+            cache_case_artifacts(case, paths, args)
+    install_case_trust_header(paths, args)
+
+    broker = build_broker(case, paths)
+    total_warmups = int(case["warmup_iterations"])
+    total_iterations = int(case["iterations"])
+    batches = attempt_batches(total_warmups, total_iterations, args.session_attempt_limit)
+    firmware_iterations = (
+        args.session_attempt_limit
+        if args.session_attempt_limit > 0 and (total_warmups + total_iterations) > args.session_attempt_limit
+        else None
+    )
+    firmware_warmups = (
+        0
+        if args.session_attempt_limit > 0 and (total_warmups + total_iterations) > args.session_attempt_limit
+        else None
+    )
+    firmware_key = firmware_profile_key(
+        case,
+        args,
+        iterations=firmware_iterations,
+        warmup_iterations=firmware_warmups,
+    )
+
+    build_dir = None
+    if not args.skip_flash:
+        firmware_builds = getattr(args, "_firmware_builds", {})
+        if firmware_key in firmware_builds:
+            build_dir = Path(firmware_builds[firmware_key])
+        else:
+            if firmware_iterations is not None:
+                build_dir = build_firmware(
+                    case,
+                    paths,
+                    args,
+                    iterations=firmware_iterations,
+                    warmup_iterations=firmware_warmups,
+                )
+            else:
+                build_dir = build_firmware(case, paths, args)
+            firmware_builds[firmware_key] = str(build_dir)
+            args._firmware_builds = firmware_builds
+
+    return PreparedCase(
+        sequence=sequence,
+        case=case,
+        paths=paths,
+        broker=broker,
+        batches=batches,
+        build_dir=build_dir,
+        firmware_key=firmware_key,
+        attempts=[],
+    )
+
+
+def build_session_schedule(
+    prepared_cases: list[PreparedCase],
+    args: argparse.Namespace,
+    rng: random.Random,
+) -> list[SessionJob]:
+    jobs: list[SessionJob] = []
+    for prepared in prepared_cases:
+        for repeat_index in range(1, args.sessions_per_case + 1):
+            for batch_index, (session_warmups, session_iterations) in enumerate(prepared.batches, start=1):
+                jobs.append(
+                    SessionJob(
+                        session_sequence=0,
+                        case_sequence=prepared.sequence,
+                        case_id=prepared.case["case_id"],
+                        repeat_index=repeat_index,
+                        batch_index=batch_index,
+                        batch_count=len(prepared.batches),
+                        session_warmups=session_warmups,
+                        session_iterations=session_iterations,
+                    )
+                )
+    rng.shuffle(jobs)
+    for index, job in enumerate(jobs, start=1):
+        job.session_sequence = index
+    return jobs
+
+
+def write_session_manifest(run_dir: Path, jobs: list[SessionJob]) -> None:
+    rows = [
+        {
+            "session_sequence": job.session_sequence,
+            "case_sequence": job.case_sequence,
+            "case_id": job.case_id,
+            "repeat_index": job.repeat_index,
+            "batch_index": job.batch_index,
+            "batch_count": job.batch_count,
+            "warmups": job.session_warmups,
+            "iterations": job.session_iterations,
+        }
+        for job in jobs
+    ]
+    write_csv(
+        run_dir / "session_manifest.csv",
+        [
+            "session_sequence",
+            "case_sequence",
+            "case_id",
+            "repeat_index",
+            "batch_index",
+            "batch_count",
+            "warmups",
+            "iterations",
+        ],
+        rows,
+    )
+
+
+def run_scheduled_session(
+    job: SessionJob,
+    prepared_by_sequence: dict[int, PreparedCase],
+    total_sessions: int,
+    args: argparse.Namespace,
+) -> None:
+    prepared = prepared_by_sequence[job.case_sequence]
+    print(
+        f"  session {job.session_sequence}/{total_sessions} "
+        f"case={job.case_id} repeat={job.repeat_index}/{args.sessions_per_case} "
+        f"batch={job.batch_index}/{job.batch_count} "
+        f"warmups={job.session_warmups} iterations={job.session_iterations}",
+        flush=True,
+    )
+    flash_needed = (
+        not args.skip_flash
+        and getattr(args, "_flashed_firmware_key", None) != prepared.firmware_key
+    )
+    session_attempts = run_case_session(
+        job.session_sequence,
+        total_sessions,
+        job.session_warmups,
+        job.session_iterations,
+        prepared.broker,
+        prepared.paths,
+        prepared.case,
+        args,
+        build_dir=prepared.build_dir,
+        flash_session=flash_needed,
+    )
+    if flash_needed:
+        args._flashed_firmware_key = prepared.firmware_key
+    if not session_attempts:
+        session_attempts = [
+            {
+                "attempt_index": 1,
+                "warmup": 0,
+                "status": "timeout",
+                "tcp_connect_ms": "",
+                "tls_handshake_ms": "",
+                "raw_handshake_ms": "",
+                "mqtt_connect_ms": "",
+                "full_connect_ms": "",
+                "error_code": "",
+                "message": (
+                    f"session {job.session_sequence} produced no BENCH_ATTEMPT "
+                    f"within {args.session_timeout_sec}s"
+                ),
+            }
+        ]
+    prepared.attempts.extend(
+        renumber_session_attempts(
+            session_attempts,
+            start_index=prepared.next_attempt_index,
+            session_warmups=job.session_warmups,
+        )
+    )
+    prepared.next_attempt_index += len(session_attempts)
+
+
 def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.Namespace) -> dict[str, object]:
     paths = case_paths(run_dir, sequence, case["case_id"])
     paths.root.mkdir(parents=True, exist_ok=False)
@@ -1292,6 +1667,7 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
                 write_csv(paths.attempts_csv, ATTEMPT_FIELDS, attempts)
                 return summarize(case, attempts, "certificate generation unsupported")
             cache_case_artifacts(case, paths, args)
+    install_case_trust_header(paths, args)
 
     broker = build_broker(case, paths)
 
@@ -1433,6 +1809,8 @@ def parse_args() -> argparse.Namespace:
                         help="reset the board after each case to clear firmware/network state")
     parser.add_argument("--session-attempt-limit", type=int, default=None,
                         help="max warmup+measured attempts per IPSP session; 0 disables session splitting; defaults to 1 for pqm4-clean")
+    parser.add_argument("--sessions-per-case", type=int, default=2,
+                        help="repeat the full session plan for each benchmark case before summarizing results")
     parser.add_argument("--connect-retries", type=int, default=3,
                         help="firmware connection tries per BENCH_ATTEMPT")
     parser.add_argument("--connect-retry-delay-sec", type=float, default=2.0,
@@ -1455,6 +1833,8 @@ def parse_args() -> argparse.Namespace:
                         help="ML-KEM implementation used by firmware TLS groups; ECDHE cases ignore this")
     parser.add_argument("--universal-kem-firmware", action=argparse.BooleanOptionalAction, default=True,
                         help="build firmware with every benchmark KEM group enabled; server selects the per-case group")
+    parser.add_argument("--universal-ca-bundle", action=argparse.BooleanOptionalAction, default=True,
+                        help="build firmware with a CA trust bundle for every certificate algorithm in this run")
     parser.add_argument("--port", type=int, default=8883)
     parser.add_argument("--nrfutil", default="/home/thiago/.local/bin/nrfutil")
     parser.add_argument("--ncs-version", default="v2.6.0")
@@ -1474,6 +1854,8 @@ def main() -> int:
     args = parse_args()
     if args.session_attempt_limit is None:
         args.session_attempt_limit = 1 if args.mlkem_backend == "pqm4-clean" else 0
+    if args.sessions_per_case < 1:
+        raise ValueError("--sessions-per-case must be at least 1")
     if args.firmware_reboot_after_attempt is None:
         args.firmware_reboot_after_attempt = False
     if not args.dry_run:
@@ -1507,11 +1889,17 @@ def main() -> int:
     if not args.dry_run:
         docker_run(["setup-openssl-conf"], run_dir / "docker.log")
         docker_run(["oqs-check"], run_dir / "docker.log")
+        prepare_universal_ca_bundle(rows, run_dir, args)
 
+    prepared_cases: list[PreparedCase] = []
     for sequence, case in enumerate(rows, start=1):
-        print(f"[{sequence}/{len(rows)}] {case['case_id']}")
+        print(f"[prepare {sequence}/{len(rows)}] {case['case_id']}")
         try:
-            summary = run_case(sequence, case, run_dir, args)
+            prepared_or_summary = prepare_case_for_schedule(sequence, case, run_dir, args)
+            if isinstance(prepared_or_summary, PreparedCase):
+                prepared_cases.append(prepared_or_summary)
+                continue
+            summary = prepared_or_summary
         except Exception as exc:  # keep the full run alive and record the failed case
             paths = case_paths(run_dir, sequence, case["case_id"])
             paths.root.mkdir(parents=True, exist_ok=True)
@@ -1535,6 +1923,56 @@ def main() -> int:
             summary = summarize(case, attempts, str(exc))
             print(f"  error: {exc}", file=sys.stderr)
         append_summary(run_dir / "summary.csv", summary)
+
+    session_jobs = build_session_schedule(prepared_cases, args, rng)
+    write_session_manifest(run_dir, session_jobs)
+    prepared_by_sequence = {prepared.sequence: prepared for prepared in prepared_cases}
+
+    for job in session_jobs:
+        try:
+            run_scheduled_session(job, prepared_by_sequence, len(session_jobs), args)
+        except Exception as exc:
+            prepared = prepared_by_sequence[job.case_sequence]
+            error_attempt = {
+                "attempt_index": prepared.next_attempt_index,
+                "warmup": 0,
+                "status": "error",
+                "tcp_connect_ms": "",
+                "tls_handshake_ms": "",
+                "raw_handshake_ms": "",
+                "mqtt_connect_ms": "",
+                "full_connect_ms": "",
+                "error_code": "",
+                "message": (
+                    f"session {job.session_sequence} repeat={job.repeat_index} "
+                    f"batch={job.batch_index} failed: {exc}"
+                ),
+            }
+            prepared.attempts.append(error_attempt)
+            prepared.next_attempt_index += 1
+            print(f"  error: {exc}", file=sys.stderr)
+
+    for prepared in prepared_cases:
+        attempts = prepared.attempts
+        if not attempts:
+            attempts = [
+                {
+                    "attempt_index": 0,
+                    "warmup": 0,
+                    "status": "timeout",
+                    "tcp_connect_ms": "",
+                    "tls_handshake_ms": "",
+                    "raw_handshake_ms": "",
+                    "mqtt_connect_ms": "",
+                    "full_connect_ms": "",
+                    "error_code": "",
+                    "message": "no BENCH_ATTEMPT lines captured",
+                }
+            ]
+        attempts = attach_attempt_case_metadata(prepared.case, attempts)
+        if not prepared.paths.attempts_csv.exists():
+            write_csv(prepared.paths.attempts_csv, ATTEMPT_FIELDS, attempts)
+        append_summary(run_dir / "summary.csv", summarize(prepared.case, attempts))
 
     print(f"results={run_dir}")
     return 0

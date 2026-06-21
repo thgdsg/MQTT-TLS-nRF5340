@@ -21,6 +21,8 @@ Columns:
 - `kex_ciphertext_bytes`: ciphertext / peer key share size for the key exchange.
 - `kex_shared_secret_bytes`: derived shared secret size for the key exchange.
 - `cert_sig_alg`: certificate/signature algorithm to use for server auth.
+  With universal CA bundle enabled, the firmware trust store may contain the CAs
+  for multiple `cert_sig_alg` values from the same run.
 - `sig_nist_level`: NIST security level for the signature algorithm.
 - `sig_public_key_bytes`: signature public key size.
 - `sig_private_key_bytes`: signature private key size.
@@ -36,10 +38,27 @@ Columns:
 
 Columns:
 
-- `sequence`: 1-based execution order after shuffling.
+- `sequence`: 1-based case preparation order after shuffling the input cases.
 - all input case columns.
 - `seed`: seed used to shuffle cases.
 - `run_id`: result directory name.
+
+## Session Manifest
+
+`results/<run_id>/session_manifest.csv` records the actual randomized session
+execution order. By default each case's full session plan appears twice because
+`run_benchmarks.py` defaults to `--sessions-per-case 2`.
+
+Columns:
+
+- `session_sequence`: 1-based execution order for sessions.
+- `case_sequence`: case preparation order from `run_manifest.csv`.
+- `case_id`: case identifier.
+- `repeat_index`: which full-session repeat this job belongs to.
+- `batch_index`: which split batch of the case this session runs.
+- `batch_count`: number of split batches in one full case plan.
+- `warmups`: warmup attempts requested for this session.
+- `iterations`: measured attempts requested for this session.
 
 ## Attempts
 
