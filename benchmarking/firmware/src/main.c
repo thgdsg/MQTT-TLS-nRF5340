@@ -52,6 +52,10 @@
 #define APP_TLS_GROUP_NAME "MLKEM512"
 #endif
 
+#ifndef APP_TLS_GROUP_UNIVERSAL
+#define APP_TLS_GROUP_UNIVERSAL 0
+#endif
+
 #define BENCH_EVENT(...) printk(__VA_ARGS__)
 
 #if defined(CONFIG_APP_BENCH_VERBOSE_LOGS)
@@ -561,9 +565,23 @@ static int tls_verify_cb(int preverify, WOLFSSL_X509_STORE_CTX *store)
 
 static int tls_setup_cb(MqttClient *client)
 {
+#if APP_TLS_GROUP_UNIVERSAL
+	int groups[] = {
+		WOLFSSL_ML_KEM_512,
+		WOLFSSL_ML_KEM_768,
+		WOLFSSL_ML_KEM_1024,
+		WOLFSSL_SECP256R1MLKEM768,
+		WOLFSSL_X25519MLKEM768,
+		WOLFSSL_SECP384R1MLKEM1024,
+		WOLFSSL_ECC_SECP256R1,
+		WOLFSSL_ECC_SECP384R1,
+		WOLFSSL_ECC_SECP521R1,
+	};
+#else
 	int groups[] = {
 		APP_TLS_GROUP_ID,
 	};
+#endif
 	int64_t start = k_uptime_get();
 	int rc;
 
@@ -614,7 +632,7 @@ static int tls_setup_cb(MqttClient *client)
 	}
 #endif
 
-	BENCH_DEBUG("TLS 1.3 key exchange group: %s\n", APP_TLS_GROUP_NAME);
+	BENCH_DEBUG("TLS 1.3 key exchange groups: %s\n", APP_TLS_GROUP_NAME);
 	BENCH_DEBUG("ML-KEM backend: %s\n", APP_MLKEM_BACKEND_NAME);
 	print_memory_stats("tls_setup_done");
 	last_tls_setup_ms = (int)k_uptime_delta(&start);

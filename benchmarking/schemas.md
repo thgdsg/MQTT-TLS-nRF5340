@@ -13,6 +13,9 @@ Columns:
 - `case_id`: stable case identifier.
 - `enabled`: `1` or `0`.
 - `kex_group`: TLS 1.3 key exchange group, such as `MLKEM768`.
+  With universal KEM firmware enabled, this is the group forced by the
+  benchmark server for the case; the board firmware may advertise multiple
+  groups from one flashed image.
 - `kex_nist_level`: NIST security level for the key exchange group.
 - `kex_public_key_bytes`: public key / key share size for the key exchange.
 - `kex_ciphertext_bytes`: ciphertext / peer key share size for the key exchange.

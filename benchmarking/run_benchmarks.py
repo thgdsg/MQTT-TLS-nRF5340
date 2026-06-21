@@ -477,6 +477,58 @@ def case_paths(run_dir: Path, sequence: int, case_id: str) -> CasePaths:
     )
 
 
+def slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def universal_kem_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "universal_kem_firmware", True))
+
+
+def cert_artifact_cache_key(case: dict[str, str], args: argparse.Namespace) -> str:
+    if universal_kem_enabled(args):
+        return f"cert__{slug(case['cert_sig_alg'])}"
+    return case["case_id"]
+
+
+def cert_generation_case(case: dict[str, str], args: argparse.Namespace) -> dict[str, str]:
+    if not universal_kem_enabled(args):
+        return case
+    shared = dict(case)
+    shared["case_id"] = cert_artifact_cache_key(case, args)
+    return shared
+
+
+def firmware_profile_key(
+    case: dict[str, str],
+    args: argparse.Namespace,
+    *,
+    iterations: int | None = None,
+    warmup_iterations: int | None = None,
+) -> str:
+    kex_part = "universal-kem" if universal_kem_enabled(args) else slug(case["kex_group"])
+    iter_part = iterations if iterations is not None else case["iterations"]
+    warmup_part = warmup_iterations if warmup_iterations is not None else case["warmup_iterations"]
+    verbose_part = "verbose" if args.firmware_verbose_logs else "quiet"
+    reboot_part = "reboot" if args.firmware_reboot_after_attempt else "no-reboot"
+    return "__".join(
+        [
+            kex_part,
+            f"cert_{slug(case['cert_sig_alg'])}",
+            f"mlkem_{slug(args.mlkem_backend)}",
+            f"iter_{iter_part}",
+            f"warmup_{warmup_part}",
+            f"cmd_{int(args.mqtt_cmd_timeout_sec * 1000)}",
+            f"hs_{int(args.tls_handshake_timeout_sec * 1000)}",
+            f"io_{int(args.tls_io_timeout_sec * 1000)}",
+            f"retry_{args.connect_retries}",
+            f"delay_{int(args.connect_retry_delay_sec * 1000)}",
+            reboot_part,
+            verbose_part,
+        ]
+    )
+
+
 def unsupported_attempt(message: str) -> list[dict[str, object]]:
     row = {
         "attempt_index": 0,
@@ -659,12 +711,12 @@ def generate_certs(case: dict[str, str], paths: CasePaths) -> bool:
     return proc.returncode == 0
 
 
-def case_artifact_cache(case: dict[str, str]) -> Path:
-    return WORK_DIR / "case-artifacts" / case["case_id"]
+def case_artifact_cache(case: dict[str, str], args: argparse.Namespace) -> Path:
+    return WORK_DIR / "case-artifacts" / cert_artifact_cache_key(case, args)
 
 
-def restore_cached_case_artifacts(case: dict[str, str], paths: CasePaths) -> bool:
-    cache = case_artifact_cache(case)
+def restore_cached_case_artifacts(case: dict[str, str], paths: CasePaths, args: argparse.Namespace) -> bool:
+    cache = case_artifact_cache(case, args)
     if not (cache / "certs" / "server.crt").exists():
         return False
     if not (cache / "certs" / "server.key").exists():
@@ -677,8 +729,8 @@ def restore_cached_case_artifacts(case: dict[str, str], paths: CasePaths) -> boo
     return True
 
 
-def cache_case_artifacts(case: dict[str, str], paths: CasePaths) -> None:
-    cache = case_artifact_cache(case)
+def cache_case_artifacts(case: dict[str, str], paths: CasePaths, args: argparse.Namespace) -> None:
+    cache = case_artifact_cache(case, args)
     if cache.exists():
         shutil.rmtree(cache)
     shutil.copytree(paths.certs, cache / "certs")
@@ -712,7 +764,13 @@ def build_firmware(
 ) -> Path:
     ensure_wolfssl_rsa_max_signature_limit()
 
-    build_dir = WORK_DIR / "firmware-build" / case["case_id"]
+    profile_key = firmware_profile_key(
+        case,
+        args,
+        iterations=iterations,
+        warmup_iterations=warmup_iterations,
+    )
+    build_dir = WORK_DIR / "firmware-build" / profile_key
     overlay = paths.generated / "bench_overlay.conf"
     default_generated = WORK_DIR / "generated" / "default"
     default_generated.mkdir(parents=True, exist_ok=True)
@@ -745,8 +803,11 @@ def build_firmware(
         "SecP384r1MLKEM1024",
     }
     mlkem_backend_config = "CONFIG_APP_BENCH_MLKEM_BACKEND_WOLFSSL=y"
-    if case["kex_group"] in mlkem_groups and args.mlkem_backend == "pqm4-clean":
+    if (universal_kem_enabled(args) or case["kex_group"] in mlkem_groups) and args.mlkem_backend == "pqm4-clean":
         mlkem_backend_config = "CONFIG_APP_BENCH_MLKEM_BACKEND_PQM4_CLEAN=y"
+    group_config = "CONFIG_APP_BENCH_TLS_GROUP_UNIVERSAL=y"
+    if not universal_kem_enabled(args):
+        group_config = group_configs[case["kex_group"]]
     firmware_debug_config = [
         f"CONFIG_APP_BENCH_VERBOSE_LOGS={'y' if args.firmware_verbose_logs else 'n'}",
         f"CONFIG_APP_BENCH_WOLFSSL_DEBUG={'y' if args.firmware_verbose_logs else 'n'}",
@@ -766,7 +827,7 @@ def build_firmware(
                 f"CONFIG_APP_BENCH_CONNECT_RETRIES={args.connect_retries}",
                 f"CONFIG_APP_BENCH_CONNECT_RETRY_DELAY_MS={int(args.connect_retry_delay_sec * 1000)}",
                 f"CONFIG_APP_BENCH_REBOOT_AFTER_ATTEMPT={'y' if args.firmware_reboot_after_attempt else 'n'}",
-                group_configs[case["kex_group"]],
+                group_config,
                 mlkem_backend_config,
                 *firmware_debug_config,
                 "",
@@ -1218,18 +1279,19 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
         return summarize(case, attempts, "dry-run")
 
     if args.skip_flash:
-        if not restore_cached_case_artifacts(case, paths):
+        if not restore_cached_case_artifacts(case, paths, args):
             raise FileNotFoundError(
-                f"--skip-flash requires cached certs for {case['case_id']} under "
-                f"{case_artifact_cache(case)}. Run this case once without --skip-flash first."
+                f"--skip-flash requires cached certs for {cert_artifact_cache_key(case, args)} under "
+                f"{case_artifact_cache(case, args)}. Run a compatible case once without --skip-flash first."
             )
     else:
-        if not generate_certs(case, paths):
-            attempts = unsupported_attempt("certificate generation unsupported")
-            attempts = attach_attempt_case_metadata(case, attempts)
-            write_csv(paths.attempts_csv, ATTEMPT_FIELDS, attempts)
-            return summarize(case, attempts, "certificate generation unsupported")
-        cache_case_artifacts(case, paths)
+        if not restore_cached_case_artifacts(case, paths, args):
+            if not generate_certs(cert_generation_case(case, args), paths):
+                attempts = unsupported_attempt("certificate generation unsupported")
+                attempts = attach_attempt_case_metadata(case, attempts)
+                write_csv(paths.attempts_csv, ATTEMPT_FIELDS, attempts)
+                return summarize(case, attempts, "certificate generation unsupported")
+            cache_case_artifacts(case, paths, args)
 
     broker = build_broker(case, paths)
 
@@ -1237,20 +1299,39 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
     total_iterations = int(case["iterations"])
     batches = attempt_batches(total_warmups, total_iterations, args.session_attempt_limit)
     build_dir = None
+    firmware_key = firmware_profile_key(
+        case,
+        args,
+        iterations=args.session_attempt_limit if (
+            args.session_attempt_limit > 0 and (total_warmups + total_iterations) > args.session_attempt_limit
+        ) else None,
+        warmup_iterations=0 if (
+            args.session_attempt_limit > 0 and (total_warmups + total_iterations) > args.session_attempt_limit
+        ) else None,
+    )
     if not args.skip_flash:
-        if args.session_attempt_limit > 0 and (total_warmups + total_iterations) > args.session_attempt_limit:
-            build_dir = build_firmware(
-                case,
-                paths,
-                args,
-                iterations=args.session_attempt_limit,
-                warmup_iterations=0,
-            )
+        firmware_builds = getattr(args, "_firmware_builds", {})
+        if firmware_key in firmware_builds:
+            build_dir = Path(firmware_builds[firmware_key])
         else:
-            build_dir = build_firmware(case, paths, args)
+            if args.session_attempt_limit > 0 and (total_warmups + total_iterations) > args.session_attempt_limit:
+                build_dir = build_firmware(
+                    case,
+                    paths,
+                    args,
+                    iterations=args.session_attempt_limit,
+                    warmup_iterations=0,
+                )
+            else:
+                build_dir = build_firmware(case, paths, args)
+            firmware_builds[firmware_key] = str(build_dir)
+            args._firmware_builds = firmware_builds
 
     attempts: list[dict[str, object]] = []
     next_attempt_index = 1
+    flash_needed_for_case = (
+        not args.skip_flash and getattr(args, "_flashed_firmware_key", None) != firmware_key
+    )
     for session_index, (session_warmups, session_iterations) in enumerate(batches, start=1):
         print(
             f"  session {session_index}/{len(batches)} "
@@ -1267,8 +1348,10 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
             case,
             args,
             build_dir=build_dir,
-            flash_session=session_index == 1 and not args.skip_flash,
+            flash_session=session_index == 1 and flash_needed_for_case,
         )
+        if session_index == 1 and flash_needed_for_case:
+            args._flashed_firmware_key = firmware_key
         if not session_attempts:
             session_attempts = [
                 {
@@ -1370,6 +1453,8 @@ def parse_args() -> argparse.Namespace:
                         help="enable firmware and wolfSSL debug logs for diagnosis; do not use for timing runs")
     parser.add_argument("--mlkem-backend", choices=("wolfssl", "pqm4-clean"), default="wolfssl",
                         help="ML-KEM implementation used by firmware TLS groups; ECDHE cases ignore this")
+    parser.add_argument("--universal-kem-firmware", action=argparse.BooleanOptionalAction, default=True,
+                        help="build firmware with every benchmark KEM group enabled; server selects the per-case group")
     parser.add_argument("--port", type=int, default=8883)
     parser.add_argument("--nrfutil", default="/home/thiago/.local/bin/nrfutil")
     parser.add_argument("--ncs-version", default="v2.6.0")

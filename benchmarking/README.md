@@ -41,6 +41,31 @@ through wolfSSL's CryptoCb hook, including the ML-KEM portion of hybrid groups.
 TLS framing, classical ECDHE/X25519, certificate verification, MQTT, and all
 non-ML-KEM algorithms still use the normal wolfSSL/wolfMQTT path.
 
+## Universal KEM Firmware
+
+By default, the benchmark firmware is built with every supported TLS 1.3 key
+exchange group enabled:
+
+- `MLKEM512`, `MLKEM768`, `MLKEM1024`
+- `SecP256r1MLKEM768`, `X25519MLKEM768`, `SecP384r1MLKEM1024`
+- `ECDHE-P-256`, `ECDHE-P-384`, `ECDHE-P-521`
+
+The board advertises this full list and the benchmark server selects the
+per-case KEM through its OpenSSL/Mosquitto configuration. This means cases that
+only change `kex_group` but keep the same `cert_sig_alg` can reuse the same
+flashed firmware image; the runner resets the board and starts a new broker
+instead of flashing again.
+
+Certificate/signature algorithms are still embedded through the generated
+firmware trust anchor. Changing `cert_sig_alg` can still require a new firmware
+image until a full CA bundle mode is added.
+
+To return to the older one-KEM-per-firmware behavior, add:
+
+```bash
+--no-universal-kem-firmware
+```
+
 ## Layout
 
 ```text
@@ -140,10 +165,14 @@ python benchmarking/run_benchmarks.py \
 
 The runner will:
 
-1. Generate per-case certificates under `benchmarking/results/<run_id>/cases/...`.
+1. Generate certificates under `benchmarking/results/<run_id>/cases/...`.
+   With universal KEM firmware enabled, certificate artifacts are cached per
+   `cert_sig_alg` and reused across KEM variants.
 2. Validate the Mosquitto/OpenSSL/OQS broker environment.
 3. Build the benchmark firmware in `benchmarking/work/firmware-build/`.
-4. Flash the board with `nrfutil`.
+   With universal KEM firmware enabled, the build cache key ignores
+   `kex_group`, so changing only the KEM does not rebuild the board firmware.
+4. Flash the board with `nrfutil` only when the firmware profile changed.
 5. Reconnect IPSP using the existing `host/ipsp_connect.sh`.
 6. Start Mosquitto in Docker with a per-case OpenSSL config that sets the TLS
    group, for example `Groups = MLKEM512`.
@@ -193,9 +222,13 @@ Useful hardware-run options:
 - `--mlkem-backend wolfssl|pqm4-clean`: choose the firmware implementation for
   MLKEM512/768/1024 and for the ML-KEM part of hybrid groups. ECDHE cases
   ignore this option.
+- `--universal-kem-firmware` / `--no-universal-kem-firmware`: keep one flashed
+  firmware image for all KEMs that share the same certificate/signature
+  algorithm, or return to the older one-KEM-per-firmware mode.
 - `--skip-flash`: do not program the board again; the runner only resets it.
-  This requires cached cert artifacts for the same `case_id`, created by a
-  previous run without `--skip-flash`.
+  With universal KEM firmware enabled, this requires cached cert artifacts for
+  the same `cert_sig_alg`; with `--no-universal-kem-firmware`, it requires the
+  same `case_id`.
 - `--reset-after-case` / `--no-reset-after-case`: reset the board after each
   case by default, clearing firmware-side network/TLS state before the next
   cryptographic combination.
