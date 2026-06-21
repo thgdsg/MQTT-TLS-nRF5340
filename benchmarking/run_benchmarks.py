@@ -27,6 +27,7 @@ WORK_DIR = BENCH_ROOT / "work"
 RESULTS_DIR = BENCH_ROOT / "results"
 CONTAINER_ROOT = Path("/workspace/ipsp_mqtt_tls_wolf")
 IPSP_CONNECT_SCRIPT = ROOT / "host" / "ipsp_connect.sh"
+WOLFSSL_TYPES_H = ROOT / "modules" / "wolfssl" / "wolfssl" / "wolfcrypt" / "types.h"
 
 INPUT_FIELDS = [
     "case_id",
@@ -51,8 +52,19 @@ ATTEMPT_FIELDS = [
     "attempt_index",
     "warmup",
     "status",
+    "kex_group",
+    "kex_nist_level",
+    "kex_public_key_bytes",
+    "kex_ciphertext_bytes",
+    "kex_shared_secret_bytes",
+    "cert_sig_alg",
+    "sig_nist_level",
+    "sig_public_key_bytes",
+    "sig_private_key_bytes",
+    "sig_signature_bytes",
     "tcp_connect_ms",
     "tls_handshake_ms",
+    "raw_handshake_ms",
     "mqtt_connect_ms",
     "full_connect_ms",
     "error_code",
@@ -90,6 +102,13 @@ SUMMARY_FIELDS = [
     "max_handshake_ms",
     "stddev_handshake_ms",
     "handshake_throughput_hps",
+    "mean_raw_handshake_ms",
+    "median_raw_handshake_ms",
+    "p95_raw_handshake_ms",
+    "min_raw_handshake_ms",
+    "max_raw_handshake_ms",
+    "stddev_raw_handshake_ms",
+    "raw_handshake_throughput_hps",
     "mean_full_connect_ms",
     "connections_per_second",
     "mean_client_cpu_ms",
@@ -241,6 +260,58 @@ def sudo_noninteractive_hint(script: Path) -> str:
         "Then validate with:\n"
         f"  sudo -n {script} F9:79:AE:2A:9A:1E 2\n"
         f"  sudo -n {script} --cleanup bt0"
+    )
+
+
+def command_log_tail(log_path: Path, max_lines: int = 80) -> str:
+    if not log_path.exists():
+        return ""
+    lines = log_path.read_text(errors="replace").splitlines()
+    return "\n".join(lines[-max_lines:])
+
+
+def log_tail_has_sudo_auth_error(log_path: Path) -> bool:
+    tail = command_log_tail(log_path).lower()
+    return (
+        "sudo: a password is required" in tail
+        or "sudo: a terminal is required" in tail
+        or "sudo: a senha" in tail
+        or "password is required" in tail
+        or "not allowed to execute" in tail
+        or "user may not run sudo" in tail
+    )
+
+
+def replace_file_even_if_owned_by_container(path: Path, content: str) -> None:
+    tmp = path.with_name(f".{path.name}.benchpatch.tmp")
+    tmp.write_text(content)
+    os.replace(tmp, path)
+
+
+def ensure_wolfssl_rsa_max_signature_limit() -> None:
+    if not WOLFSSL_TYPES_H.exists():
+        raise FileNotFoundError(f"wolfSSL types.h not found: {WOLFSSL_TYPES_H}")
+
+    current = WOLFSSL_TYPES_H.read_text()
+    patched = (
+        "#if defined(RSA_MAX_SIZE) && RSA_MAX_SIZE > 8192\n"
+        "    MAX_ENCODED_CLASSIC_SIG_SZ = WC_BITS_TO_BYTES(RSA_MAX_SIZE),\n"
+        "#elif defined(USE_FAST_MATH) && defined(FP_MAX_BITS)"
+    )
+    if patched in current:
+        return
+
+    original = "#if defined(USE_FAST_MATH) && defined(FP_MAX_BITS)"
+    if original not in current:
+        raise RuntimeError(
+            "Unable to patch wolfSSL MAX_ENCODED_CLASSIC_SIG_SZ; expected marker not found"
+        )
+
+    # Some Docker-created module files may be owned by nobody. Replacing the
+    # inode keeps this reproducible without requiring sudo for benchmark runs.
+    replace_file_even_if_owned_by_container(
+        WOLFSSL_TYPES_H,
+        current.replace(original, patched, 1),
     )
 
 
@@ -413,6 +484,7 @@ def unsupported_attempt(message: str) -> list[dict[str, object]]:
         "status": "unsupported",
         "tcp_connect_ms": "",
         "tls_handshake_ms": "",
+        "raw_handshake_ms": "",
         "mqtt_connect_ms": "",
         "full_connect_ms": "",
         "error_code": "",
@@ -420,6 +492,28 @@ def unsupported_attempt(message: str) -> list[dict[str, object]]:
     }
     row.update({field: "" for field in ATTEMPT_RESOURCE_FIELDS})
     return [row]
+
+
+ATTEMPT_CASE_METADATA_FIELDS = [
+    "kex_group",
+    "kex_nist_level",
+    "kex_public_key_bytes",
+    "kex_ciphertext_bytes",
+    "kex_shared_secret_bytes",
+    "cert_sig_alg",
+    "sig_nist_level",
+    "sig_public_key_bytes",
+    "sig_private_key_bytes",
+    "sig_signature_bytes",
+]
+
+
+def attach_attempt_case_metadata(case: dict[str, str], attempts: list[dict[str, object]]) -> list[dict[str, object]]:
+    enriched: list[dict[str, object]] = []
+    metadata = {field: case.get(field, "") for field in ATTEMPT_CASE_METADATA_FIELDS}
+    for attempt in attempts:
+        enriched.append({**metadata, **attempt})
+    return enriched
 
 
 def summarize(case: dict[str, str], attempts: list[dict[str, object]], notes: str = "") -> dict[str, object]:
@@ -430,6 +524,11 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]], notes: st
     failures = [a for a in measured if a.get("status") not in ("success", "timeout", "unsupported")]
 
     handshake = [float(a["tls_handshake_ms"]) for a in successes if str(a.get("tls_handshake_ms", "")) != ""]
+    raw_handshake = [
+        float(a["raw_handshake_ms"])
+        for a in successes
+        if str(a.get("raw_handshake_ms", "")) != ""
+    ]
     full = [float(a["full_connect_ms"]) for a in successes if str(a.get("full_connect_ms", "")) != ""]
 
     def numeric_attempt_values(field: str) -> list[float]:
@@ -452,6 +551,7 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]], notes: st
         status = "unsupported"
 
     mean_handshake = statistics.mean(handshake) if handshake else None
+    mean_raw_handshake = statistics.mean(raw_handshake) if raw_handshake else None
     mean_full = statistics.mean(full) if full else None
     client_cpu_ms = numeric_attempt_values("client_cpu_ms")
     client_cpu_pct = [value / 100.0 for value in numeric_attempt_values("client_cpu_pct_x100")]
@@ -483,6 +583,13 @@ def summarize(case: dict[str, str], attempts: list[dict[str, object]], notes: st
         "max_handshake_ms": f"{max(handshake):.3f}" if handshake else "",
         "stddev_handshake_ms": f"{statistics.stdev(handshake):.3f}" if len(handshake) > 1 else "",
         "handshake_throughput_hps": f"{1000.0 / mean_handshake:.6f}" if mean_handshake else "",
+        "mean_raw_handshake_ms": f"{mean_raw_handshake:.3f}" if mean_raw_handshake is not None else "",
+        "median_raw_handshake_ms": f"{statistics.median(raw_handshake):.3f}" if raw_handshake else "",
+        "p95_raw_handshake_ms": p95(raw_handshake),
+        "min_raw_handshake_ms": f"{min(raw_handshake):.3f}" if raw_handshake else "",
+        "max_raw_handshake_ms": f"{max(raw_handshake):.3f}" if raw_handshake else "",
+        "stddev_raw_handshake_ms": f"{statistics.stdev(raw_handshake):.3f}" if len(raw_handshake) > 1 else "",
+        "raw_handshake_throughput_hps": f"{1000.0 / mean_raw_handshake:.6f}" if mean_raw_handshake else "",
         "mean_full_connect_ms": f"{mean_full:.3f}" if mean_full is not None else "",
         "connections_per_second": f"{1000.0 / mean_full:.6f}" if mean_full else "",
         "mean_client_cpu_ms": f"{statistics.mean(client_cpu_ms):.3f}" if client_cpu_ms else "",
@@ -515,18 +622,22 @@ def parse_attempt_line(line: str) -> dict[str, object] | None:
         return None
     if parts[2] not in ("success", "error", "timeout", "unsupported"):
         return None
+    has_raw_handshake = len(parts) >= 18
+    raw_handshake_ms = parts[5] if has_raw_handshake else ""
+    mqtt_index = 6 if has_raw_handshake else 5
     row = {
         "attempt_index": parts[0],
         "warmup": parts[1],
         "status": parts[2],
         "tcp_connect_ms": parts[3],
         "tls_handshake_ms": parts[4],
-        "mqtt_connect_ms": parts[5],
-        "full_connect_ms": parts[6],
-        "error_code": parts[7],
-        "message": parts[8],
+        "raw_handshake_ms": raw_handshake_ms,
+        "mqtt_connect_ms": parts[mqtt_index],
+        "full_connect_ms": parts[mqtt_index + 1],
+        "error_code": parts[mqtt_index + 2],
+        "message": parts[mqtt_index + 3],
     }
-    for index, field in enumerate(ATTEMPT_RESOURCE_FIELDS, start=9):
+    for index, field in enumerate(ATTEMPT_RESOURCE_FIELDS, start=mqtt_index + 4):
         row[field] = parts[index] if index < len(parts) else ""
     return row
 
@@ -599,6 +710,8 @@ def build_firmware(
     iterations: int | None = None,
     warmup_iterations: int | None = None,
 ) -> Path:
+    ensure_wolfssl_rsa_max_signature_limit()
+
     build_dir = WORK_DIR / "firmware-build" / case["case_id"]
     overlay = paths.generated / "bench_overlay.conf"
     default_generated = WORK_DIR / "generated" / "default"
@@ -614,12 +727,30 @@ def build_firmware(
         "MLKEM512": "CONFIG_APP_BENCH_TLS_GROUP_MLKEM512=y",
         "MLKEM768": "CONFIG_APP_BENCH_TLS_GROUP_MLKEM768=y",
         "MLKEM1024": "CONFIG_APP_BENCH_TLS_GROUP_MLKEM1024=y",
+        "SecP256r1MLKEM768": "CONFIG_APP_BENCH_TLS_GROUP_SECP256R1_MLKEM768=y",
+        "X25519MLKEM768": "CONFIG_APP_BENCH_TLS_GROUP_X25519_MLKEM768=y",
+        "SecP384r1MLKEM1024": "CONFIG_APP_BENCH_TLS_GROUP_SECP384R1_MLKEM1024=y",
         "ECDHE-P-256": "CONFIG_APP_BENCH_TLS_GROUP_ECDHE_P256=y",
         "ECDHE-P-384": "CONFIG_APP_BENCH_TLS_GROUP_ECDHE_P384=y",
         "ECDHE-P-521": "CONFIG_APP_BENCH_TLS_GROUP_ECDHE_P521=y",
     }
     if case["kex_group"] not in group_configs:
         raise ValueError(f"Unsupported firmware TLS group: {case['kex_group']}")
+    mlkem_groups = {
+        "MLKEM512",
+        "MLKEM768",
+        "MLKEM1024",
+        "SecP256r1MLKEM768",
+        "X25519MLKEM768",
+        "SecP384r1MLKEM1024",
+    }
+    mlkem_backend_config = "CONFIG_APP_BENCH_MLKEM_BACKEND_WOLFSSL=y"
+    if case["kex_group"] in mlkem_groups and args.mlkem_backend == "pqm4-clean":
+        mlkem_backend_config = "CONFIG_APP_BENCH_MLKEM_BACKEND_PQM4_CLEAN=y"
+    firmware_debug_config = [
+        f"CONFIG_APP_BENCH_VERBOSE_LOGS={'y' if args.firmware_verbose_logs else 'n'}",
+        f"CONFIG_APP_BENCH_WOLFSSL_DEBUG={'y' if args.firmware_verbose_logs else 'n'}",
+    ]
 
     overlay.parent.mkdir(parents=True, exist_ok=True)
     overlay.write_text(
@@ -634,8 +765,10 @@ def build_firmware(
                 f"CONFIG_APP_MQTT_KEEPALIVE_SEC={args.mqtt_keepalive_sec}",
                 f"CONFIG_APP_BENCH_CONNECT_RETRIES={args.connect_retries}",
                 f"CONFIG_APP_BENCH_CONNECT_RETRY_DELAY_MS={int(args.connect_retry_delay_sec * 1000)}",
-                f"CONFIG_APP_BENCH_REBOOT_AFTER_ATTEMPT={'y' if args.firmware_reboot_after_attempt and args.session_attempt_limit == 1 else 'n'}",
+                f"CONFIG_APP_BENCH_REBOOT_AFTER_ATTEMPT={'y' if args.firmware_reboot_after_attempt else 'n'}",
                 group_configs[case["kex_group"]],
+                mlkem_backend_config,
+                *firmware_debug_config,
                 "",
             ]
         )
@@ -775,8 +908,14 @@ def connect_ipsp(paths: CasePaths, args: argparse.Namespace) -> None:
     try:
         run_logged(cmd, paths.docker_log)
     except subprocess.CalledProcessError as exc:
-        if args.sudo_noninteractive and os.geteuid() != 0:
+        if args.sudo_noninteractive and os.geteuid() != 0 and log_tail_has_sudo_auth_error(paths.docker_log):
             raise PermissionError(sudo_noninteractive_hint(IPSP_CONNECT_SCRIPT)) from exc
+        tail = command_log_tail(paths.docker_log)
+        if tail:
+            raise RuntimeError(
+                f"IPSP connect script failed with exit status {exc.returncode}. "
+                f"Recent log output:\n{tail}"
+            ) from exc
         raise
 
 
@@ -1068,11 +1207,13 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
 
     if case.get("expected_support") == "known_unsupported":
         attempts = unsupported_attempt(case.get("notes", "known unsupported"))
+        attempts = attach_attempt_case_metadata(case, attempts)
         write_csv(paths.attempts_csv, ATTEMPT_FIELDS, attempts)
         return summarize(case, attempts)
 
     if args.dry_run:
         attempts = unsupported_attempt("dry-run: not executed")
+        attempts = attach_attempt_case_metadata(case, attempts)
         write_csv(paths.attempts_csv, ATTEMPT_FIELDS, attempts)
         return summarize(case, attempts, "dry-run")
 
@@ -1085,6 +1226,7 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
     else:
         if not generate_certs(case, paths):
             attempts = unsupported_attempt("certificate generation unsupported")
+            attempts = attach_attempt_case_metadata(case, attempts)
             write_csv(paths.attempts_csv, ATTEMPT_FIELDS, attempts)
             return summarize(case, attempts, "certificate generation unsupported")
         cache_case_artifacts(case, paths)
@@ -1096,7 +1238,16 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
     batches = attempt_batches(total_warmups, total_iterations, args.session_attempt_limit)
     build_dir = None
     if not args.skip_flash:
-        build_dir = build_firmware(case, paths, args)
+        if args.session_attempt_limit > 0 and (total_warmups + total_iterations) > args.session_attempt_limit:
+            build_dir = build_firmware(
+                case,
+                paths,
+                args,
+                iterations=args.session_attempt_limit,
+                warmup_iterations=0,
+            )
+        else:
+            build_dir = build_firmware(case, paths, args)
 
     attempts: list[dict[str, object]] = []
     next_attempt_index = 1
@@ -1122,10 +1273,11 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
             session_attempts = [
                 {
                     "attempt_index": 1,
-                    "warmup": 1 if session_warmups > 0 else 0,
+                    "warmup": 0,
                     "status": "timeout",
                     "tcp_connect_ms": "",
                     "tls_handshake_ms": "",
+                    "raw_handshake_ms": "",
                     "mqtt_connect_ms": "",
                     "full_connect_ms": "",
                     "error_code": "",
@@ -1149,12 +1301,14 @@ def run_case(sequence: int, case: dict[str, str], run_dir: Path, args: argparse.
                 "status": "timeout",
                 "tcp_connect_ms": "",
                 "tls_handshake_ms": "",
+                "raw_handshake_ms": "",
                 "mqtt_connect_ms": "",
                 "full_connect_ms": "",
                 "error_code": "",
                 "message": "no BENCH_ATTEMPT lines captured",
             }
         ]
+    attempts = attach_attempt_case_metadata(case, attempts)
     write_csv(paths.attempts_csv, ATTEMPT_FIELDS, attempts)
     return summarize(case, attempts)
 
@@ -1171,7 +1325,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--serial-baud", type=int, default=115200)
     parser.add_argument("--serial-reader", choices=("cat", "tio"), default="cat")
     parser.add_argument("--case-timeout-sec", type=int, default=900)
-    parser.add_argument("--session-timeout-sec", type=int, default=360,
+    parser.add_argument("--session-timeout-sec", type=int, default=420,
                         help="maximum time to wait for one split benchmark session to emit BENCH_ATTEMPT lines")
     parser.add_argument("--board-boot-timeout-sec", type=int, default=30)
     parser.add_argument("--board-ready-timeout-sec", type=int, default=30)
@@ -1194,8 +1348,8 @@ def parse_args() -> argparse.Namespace:
                         help="reuse already flashed firmware/certs for the case and only reset the board")
     parser.add_argument("--reset-after-case", action=argparse.BooleanOptionalAction, default=True,
                         help="reset the board after each case to clear firmware/network state")
-    parser.add_argument("--session-attempt-limit", type=int, default=1,
-                        help="max warmup+measured attempts per IPSP session; 0 disables session splitting")
+    parser.add_argument("--session-attempt-limit", type=int, default=None,
+                        help="max warmup+measured attempts per IPSP session; 0 disables session splitting; defaults to 1 for pqm4-clean")
     parser.add_argument("--connect-retries", type=int, default=3,
                         help="firmware connection tries per BENCH_ATTEMPT")
     parser.add_argument("--connect-retry-delay-sec", type=float, default=2.0,
@@ -1206,12 +1360,16 @@ def parse_args() -> argparse.Namespace:
                         help="firmware wolfMQTT command timeout")
     parser.add_argument("--tls-handshake-timeout-sec", type=float, default=300.0,
                         help="firmware TLS handshake deadline; heavy PQC/RSA handshakes over IPSP can exceed a minute")
-    parser.add_argument("--tls-io-timeout-sec", type=float, default=60.0,
+    parser.add_argument("--tls-io-timeout-sec", type=float, default=10.0,
                         help="per-call firmware TLS socket I/O timeout")
     parser.add_argument("--mqtt-keepalive-sec", type=int, default=120,
                         help="firmware MQTT keepalive; keep high for slow IPSP links")
-    parser.add_argument("--firmware-reboot-after-attempt", action=argparse.BooleanOptionalAction, default=True,
-                        help="when running one attempt per session, reboot firmware after each BENCH_ATTEMPT line")
+    parser.add_argument("--firmware-reboot-after-attempt", action=argparse.BooleanOptionalAction, default=None,
+                        help="reboot firmware after each BENCH_ATTEMPT line; defaults to on for pqm4-clean")
+    parser.add_argument("--firmware-verbose-logs", action="store_true",
+                        help="enable firmware and wolfSSL debug logs for diagnosis; do not use for timing runs")
+    parser.add_argument("--mlkem-backend", choices=("wolfssl", "pqm4-clean"), default="wolfssl",
+                        help="ML-KEM implementation used by firmware TLS groups; ECDHE cases ignore this")
     parser.add_argument("--port", type=int, default=8883)
     parser.add_argument("--nrfutil", default="/home/thiago/.local/bin/nrfutil")
     parser.add_argument("--ncs-version", default="v2.6.0")
@@ -1229,6 +1387,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.session_attempt_limit is None:
+        args.session_attempt_limit = 1 if args.mlkem_backend == "pqm4-clean" else 0
+    if args.firmware_reboot_after_attempt is None:
+        args.firmware_reboot_after_attempt = False
     if not args.dry_run:
         check_sudo_noninteractive(args)
 
@@ -1275,12 +1437,14 @@ def main() -> int:
                     "status": "error",
                     "tcp_connect_ms": "",
                     "tls_handshake_ms": "",
+                    "raw_handshake_ms": "",
                     "mqtt_connect_ms": "",
                     "full_connect_ms": "",
                     "error_code": "",
                     "message": str(exc),
                 }
             ]
+            attempts = attach_attempt_case_metadata(case, attempts)
             if not paths.attempts_csv.exists():
                 write_csv(paths.attempts_csv, ATTEMPT_FIELDS, attempts)
             summary = summarize(case, attempts, str(exc))

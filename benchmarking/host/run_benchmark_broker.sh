@@ -22,6 +22,7 @@ map_group()
 {
     case "$1" in
     MLKEM512|MLKEM768|MLKEM1024) printf '%s\n' "$1" ;;
+    SecP256r1MLKEM768|X25519MLKEM768|SecP384r1MLKEM1024) printf '%s\n' "$1" ;;
     ECDHE-P-256) printf 'P-256\n' ;;
     ECDHE-P-384) printf 'P-384\n' ;;
     ECDHE-P-521) printf 'P-521\n' ;;
@@ -108,5 +109,7 @@ export OPENSSL_CONF="${OPENSSL_CASE_CONF}"
 
 printf 'broker: TLS 1.3 group %s via OpenSSL group %s\n' "${TLS_GROUP}" "${OPENSSL_GROUP}"
 printf 'broker: using mosquitto with OpenSSL_CONF=%s\n' "${OPENSSL_CONF}"
+printf 'broker: mosquitto binary %s\n' "$(command -v mosquitto)"
+printf 'broker: benchmark pre-CONNECT timeout is provided by the patched Mosquitto build\n'
 
 exec mosquitto -c "${CONFIG}" -v

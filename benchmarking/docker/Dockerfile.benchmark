@@ -3,6 +3,8 @@ FROM archlinux:latest
 ARG OQS_PREFIX=/opt/oqs
 ARG LIBOQS_REF=main
 ARG OQS_PROVIDER_REF=main
+ARG MOSQUITTO_REF=v2.1.2
+ARG MOSQUITTO_PRECONNECT_KEEPALIVE=240
 
 RUN pacman -Syu --noconfirm && \
     pacman -S --noconfirm --needed \
@@ -32,6 +34,25 @@ RUN pacman -Syu --noconfirm && \
         util-linux \
         wireshark-cli && \
     pacman -Scc --noconfirm
+
+COPY benchmarking/patches/mosquitto-preconnect-keepalive.patch /tmp/mosquitto-preconnect-keepalive.patch
+
+RUN git clone --depth 1 --branch "${MOSQUITTO_REF}" https://github.com/eclipse-mosquitto/mosquitto.git /tmp/mosquitto && \
+    patch -d /tmp/mosquitto -p1 < /tmp/mosquitto-preconnect-keepalive.patch && \
+    cmake -S /tmp/mosquitto -B /tmp/mosquitto/build -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_C_FLAGS="-DMOSQ_BENCH_PRECONNECT_KEEPALIVE=${MOSQUITTO_PRECONNECT_KEEPALIVE}" \
+        -DWITH_APPS=OFF \
+        -DWITH_CLIENTS=OFF \
+        -DWITH_DOCS=OFF \
+        -DWITH_PLUGINS=OFF \
+        -DWITH_TESTS=OFF \
+        -DWITH_TLS=ON \
+        -DWITH_WEBSOCKETS=OFF && \
+    cmake --build /tmp/mosquitto/build --target mosquitto && \
+    install -m 0755 /tmp/mosquitto/build/src/mosquitto /usr/local/bin/mosquitto && \
+    rm -rf /tmp/mosquitto /tmp/mosquitto-preconnect-keepalive.patch
 
 RUN git clone --depth 1 --branch "${LIBOQS_REF}" https://github.com/open-quantum-safe/liboqs.git /tmp/liboqs && \
     cmake -S /tmp/liboqs -B /tmp/liboqs/build -GNinja \

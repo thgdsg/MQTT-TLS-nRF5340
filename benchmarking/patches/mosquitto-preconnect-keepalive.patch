@@ -1,0 +1,20 @@
+diff --git a/src/context.c b/src/context.c
+index 4f0a10e4..a52a43cc 100644
+--- a/src/context.c
++++ b/src/context.c
+@@ -82,8 +82,13 @@ struct mosquitto *context__init(void)
+ 	mosquitto__set_state(context, mosq_cs_new);
+ 	context->sock = INVALID_SOCKET;
+ 	context->last_msg_in = db.now_s;
+-	context->next_msg_out = db.now_s + 20;
+-	context->keepalive = 20; /* Default to 20s */
++	context->next_msg_out = db.now_s + MOSQ_BENCH_PRECONNECT_KEEPALIVE;
++	/*
++	 * Benchmark builds may spend a long time generating a TLS ClientHello
++	 * before MQTT CONNECT exists, especially with software PQC key exchange
++	 * on BLE/IPSP. Keep this pre-CONNECT timeout long enough for those cases.
++	 */
++	context->keepalive = MOSQ_BENCH_PRECONNECT_KEEPALIVE;
+ 	context->clean_start = true;
+ 	context->id = NULL;
+ 	context->last_mid = 0;

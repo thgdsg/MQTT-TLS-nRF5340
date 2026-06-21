@@ -23,6 +23,7 @@ class KemCase:
     public_key_bytes: int
     ciphertext_bytes: int
     shared_secret_bytes: int
+    family: str
 
 
 @dataclass(frozen=True)
@@ -32,32 +33,36 @@ class SigCase:
     public_key_bytes: int
     private_key_bytes: int
     signature_bytes: int
+    family: str
     expected_support: str = "probe"
     notes: str = ""
 
 
 KEMS = [
-    KemCase("MLKEM512", 1, 800, 768, 32),
-    KemCase("MLKEM768", 3, 1184, 1088, 32),
-    KemCase("MLKEM1024", 5, 1568, 1568, 32),
-    KemCase("ECDHE-P-256", 1, 65, 65, 32),
-    KemCase("ECDHE-P-384", 3, 97, 97, 48),
-    KemCase("ECDHE-P-521", 5, 133, 133, 66),
+    KemCase("MLKEM512", 1, 800, 768, 32, "pqc"),
+    KemCase("MLKEM768", 3, 1184, 1088, 32, "pqc"),
+    KemCase("MLKEM1024", 5, 1568, 1568, 32, "pqc"),
+    KemCase("SecP256r1MLKEM768", 3, 65 + 1184, 65 + 1088, 32 + 32, "pqc"),
+    KemCase("X25519MLKEM768", 3, 32 + 1184, 32 + 1088, 32 + 32, "pqc"),
+    KemCase("SecP384r1MLKEM1024", 5, 97 + 1568, 97 + 1568, 48 + 32, "pqc"),
+    KemCase("ECDHE-P-256", 1, 65, 65, 32, "classic"),
+    KemCase("ECDHE-P-384", 3, 97, 97, 48, "classic"),
+    KemCase("ECDHE-P-521", 5, 133, 133, 66, "classic"),
 ]
 
 SIGS = [
-    SigCase("ML-DSA-44", 2, 1312, 2560, 2420),
-    SigCase("ML-DSA-65", 3, 1952, 4032, 3309),
-    SigCase("ML-DSA-87", 5, 2592, 4896, 4627),
-    SigCase("SLH-DSA-SHAKE-128s", 1, 32, 64, 7856),
-    SigCase("SLH-DSA-SHAKE-192s", 3, 48, 96, 16224),
-    SigCase("SLH-DSA-SHAKE-256s", 5, 64, 128, 29792),
-    SigCase("ECDSA-P-256", 1, 65, 32, 64, "required", "classic approximate NIST level 1"),
-    SigCase("ECDSA-P-384", 3, 97, 48, 96, "required", "classic approximate NIST level 3"),
-    SigCase("ECDSA-P-521", 5, 133, 66, 132, "required", "classic approximate NIST level 5"),
-    SigCase("RSA-PSS-3072", 1, 384, 384, 384, "required", "classic approximate NIST level 1"),
-    SigCase("RSA-PSS-7680", 3, 960, 960, 960, "required", "classic approximate NIST level 3"),
-    SigCase("RSA-PSS-15360", 5, 1920, 1920, 1920, "required", "classic approximate NIST level 5"),
+    SigCase("ML-DSA-44", 2, 1312, 2560, 2420, "pqc"),
+    SigCase("ML-DSA-65", 3, 1952, 4032, 3309, "pqc"),
+    SigCase("ML-DSA-87", 5, 2592, 4896, 4627, "pqc"),
+    SigCase("SLH-DSA-SHAKE-128s", 1, 32, 64, 7856, "pqc"),
+    SigCase("SLH-DSA-SHAKE-192s", 3, 48, 96, 16224, "pqc"),
+    SigCase("SLH-DSA-SHAKE-256s", 5, 64, 128, 29792, "pqc"),
+    SigCase("ECDSA-P-256", 1, 65, 32, 64, "classic", "required", "classic approximate NIST level 1"),
+    SigCase("ECDSA-P-384", 3, 97, 48, 96, "classic", "required", "classic approximate NIST level 3"),
+    SigCase("ECDSA-P-521", 5, 133, 66, 132, "classic", "required", "classic approximate NIST level 5"),
+    SigCase("RSA-PSS-3072", 1, 384, 384, 384, "classic", "required", "classic approximate NIST level 1"),
+    SigCase("RSA-PSS-7680", 3, 960, 960, 960, "classic", "required", "classic approximate NIST level 3"),
+    SigCase("RSA-PSS-15360", 5, 1920, 1920, 1920, "classic", "required", "classic approximate NIST level 5"),
 ]
 
 FIELDNAMES = [
@@ -84,10 +89,12 @@ def slug(value: str) -> str:
     return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", value.lower())).strip("_")
 
 
-def build_cases(iterations: int, warmup_iterations: int) -> list[dict[str, str]]:
+def build_cases(iterations: int, warmup_iterations: int, separate_pqc_classic: bool) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for kem in KEMS:
         for sig in SIGS:
+            if separate_pqc_classic and kem.family != sig.family:
+                continue
             case_id = f"{slug(kem.name)}__{slug(sig.name)}"
             rows.append(
                 {
@@ -130,13 +137,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-iterations", type=int, default=2, help="warmup attempts per case")
     parser.add_argument("--output", type=Path, default=None, help="output CSV path")
     parser.add_argument("--no-shuffle", action="store_true", help="keep deterministic matrix order")
+    parser.add_argument(
+        "--separate-pqc-classic",
+        action="store_true",
+        help="only combine PQC/hybrid KEMs with PQC signatures and classic KEMs with classic signatures",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
-    rows = build_cases(args.iterations, args.warmup_iterations)
+    rows = build_cases(args.iterations, args.warmup_iterations, args.separate_pqc_classic)
 
     if not args.no_shuffle:
         rng = random.Random(seed)

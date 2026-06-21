@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include <zephyr/kernel.h>
+#include <zephyr/linker/section_tags.h>
 #include <zephyr/net/net_config.h>
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/socket.h>
@@ -30,6 +31,10 @@
 #include <wolfmqtt/mqtt_socket.h>
 
 #include <benchmark_cert.h>
+
+#if defined(CONFIG_APP_BENCH_MLKEM_BACKEND_PQM4_CLEAN)
+#include "pqm4_mlkem_backend.h"
+#endif
 
 #define MQTT_BUFFER_SIZE 4096
 #define MQTT_CMD_TIMEOUT_MS CONFIG_APP_MQTT_CMD_TIMEOUT_MS
@@ -59,10 +64,21 @@ struct socket_context {
 	int fd;
 };
 
+#define BENCH_REBOOT_STATE_MAGIC 0x42454e43u
+
+struct bench_reboot_state {
+	uint32_t magic;
+	int total_attempts;
+	int next_attempt;
+};
+
+static struct bench_reboot_state reboot_state __noinit;
+
 struct bench_metrics {
 	int tcp_connect_ms;
 	int tls_setup_ms;
 	int tls_handshake_ms;
+	int raw_handshake_ms;
 	int mqtt_connect_ms;
 	int full_connect_ms;
 	uint64_t client_wall_cycles;
@@ -241,6 +257,40 @@ static uint64_t runtime_cycles_to_ms(uint64_t cycles)
 
 	return hz > 0 ? (cycles * 1000U) / hz : 0;
 #endif
+}
+
+static int bench_start_attempt(int total_attempts)
+{
+	if (!IS_ENABLED(CONFIG_APP_BENCH_REBOOT_AFTER_ATTEMPT)) {
+		return 1;
+	}
+
+	if (reboot_state.magic != BENCH_REBOOT_STATE_MAGIC ||
+	    reboot_state.total_attempts != total_attempts ||
+	    reboot_state.next_attempt < 1 ||
+	    reboot_state.next_attempt > total_attempts) {
+		reboot_state.magic = BENCH_REBOOT_STATE_MAGIC;
+		reboot_state.total_attempts = total_attempts;
+		reboot_state.next_attempt = 1;
+	}
+
+	return reboot_state.next_attempt;
+}
+
+static void bench_store_next_attempt(int next_attempt, int total_attempts)
+{
+	if (!IS_ENABLED(CONFIG_APP_BENCH_REBOOT_AFTER_ATTEMPT)) {
+		return;
+	}
+
+	if (next_attempt > total_attempts) {
+		memset(&reboot_state, 0, sizeof(reboot_state));
+		return;
+	}
+
+	reboot_state.magic = BENCH_REBOOT_STATE_MAGIC;
+	reboot_state.total_attempts = total_attempts;
+	reboot_state.next_attempt = next_attempt;
 }
 
 static struct client_runtime_snapshot client_runtime_now(void)
@@ -552,7 +602,20 @@ static int tls_setup_cb(MqttClient *client)
 		return WOLFSSL_FAILURE;
 	}
 
+#if defined(CONFIG_APP_BENCH_MLKEM_BACKEND_PQM4_CLEAN)
+	rc = wolfSSL_CTX_SetDevId(client->tls.ctx, pqm4_mlkem_backend_dev_id());
+	if (rc != WOLFSSL_SUCCESS) {
+		BENCH_DEBUG("wolfSSL_CTX_SetDevId failed: %d\n", rc);
+		print_memory_stats("set_devid_failed");
+		wolfSSL_CTX_free(client->tls.ctx);
+		client->tls.ctx = NULL;
+		last_tls_setup_ms = (int)k_uptime_delta(&start);
+		return WOLFSSL_FAILURE;
+	}
+#endif
+
 	BENCH_DEBUG("TLS 1.3 key exchange group: %s\n", APP_TLS_GROUP_NAME);
+	BENCH_DEBUG("ML-KEM backend: %s\n", APP_MLKEM_BACKEND_NAME);
 	print_memory_stats("tls_setup_done");
 	last_tls_setup_ms = (int)k_uptime_delta(&start);
 
@@ -588,6 +651,8 @@ static int mqtt_tls_net_connect(struct bench_metrics *metrics)
 			metrics->tls_setup_ms = last_tls_setup_ms;
 			metrics->tls_handshake_ms =
 				MAX(0, tls_net_ms - metrics->tcp_connect_ms);
+			metrics->raw_handshake_ms =
+				MAX(0, metrics->tls_handshake_ms - metrics->tls_setup_ms);
 			return MQTT_CODE_SUCCESS;
 		}
 
@@ -804,6 +869,7 @@ int main(void)
 	const int warmups = CONFIG_APP_BENCH_WARMUP_ITERATIONS;
 	const int iterations = CONFIG_APP_BENCH_ITERATIONS;
 	const int total_attempts = warmups + iterations;
+	int start_attempt;
 	struct bench_metrics metrics;
 	int rc;
 
@@ -812,7 +878,16 @@ int main(void)
 	BENCH_DEBUG("Board IPv6: %s\n", CONFIG_NET_CONFIG_MY_IPV6_ADDR);
 	BENCH_DEBUG("Broker: [%s]:%d\n", CONFIG_APP_MQTT_BROKER_HOST,
 	    CONFIG_APP_MQTT_BROKER_PORT);
+	BENCH_DEBUG("ML-KEM backend: %s\n", APP_MLKEM_BACKEND_NAME);
 	print_memory_stats("boot");
+
+#if defined(CONFIG_APP_BENCH_MLKEM_BACKEND_PQM4_CLEAN)
+	rc = pqm4_mlkem_backend_init();
+	if (rc != 0) {
+		BENCH_EVENT("BENCH_FATAL,pqm4_backend_init,%d\n", rc);
+		return rc;
+	}
+#endif
 
 	rc = net_config_init_app(NULL, "Initializing IPSP benchmark network");
 	BENCH_DEBUG("net_config_init_app returned: %d\n", rc);
@@ -827,15 +902,22 @@ int main(void)
 	       CONFIG_APP_BENCH_INITIAL_DELAY_MS);
 	k_sleep(K_MSEC(CONFIG_APP_BENCH_INITIAL_DELAY_MS));
 
-	for (int i = 1; i <= total_attempts; i++) {
+	start_attempt = bench_start_attempt(total_attempts);
+	if (start_attempt > 1) {
+		BENCH_EVENT("BENCH_RESUME,next_attempt,%d,total,%d\n",
+			    start_attempt, total_attempts);
+	}
+
+	for (int i = start_attempt; i <= total_attempts; i++) {
 		int warmup = i <= warmups ? 1 : 0;
 		char message[80];
 
 		rc = run_one_attempt_with_retries(i, &metrics);
 		if (rc == MQTT_CODE_SUCCESS) {
-			snprintf(message, sizeof(message), "ok;tls_setup_ms=%d;tls_wire_ms=%d",
+			snprintf(message, sizeof(message),
+				 "ok;tls_setup_ms=%d;raw_handshake_ms=%d",
 				 metrics.tls_setup_ms,
-				 MAX(0, metrics.tls_handshake_ms - metrics.tls_setup_ms));
+				 metrics.raw_handshake_ms);
 		} else if (metrics.tls_last_error != 0) {
 			snprintf(message, sizeof(message), "tls_last_error=%d",
 				 metrics.tls_last_error);
@@ -843,13 +925,14 @@ int main(void)
 			snprintf(message, sizeof(message), "connect_failed");
 		}
 
-		BENCH_EVENT("BENCH_ATTEMPT,%d,%d,%s,%d,%d,%d,%d,%d,%s,"
+		BENCH_EVENT("BENCH_ATTEMPT,%d,%d,%s,%d,%d,%d,%d,%d,%d,%s,"
 			    "%llu,%llu,%llu,%u,%zu,%zu,%zu,%zu\n",
 		       i, warmup,
 		       rc == MQTT_CODE_SUCCESS ? "success" :
 		       rc == MQTT_CODE_ERROR_TIMEOUT ? "timeout" : "error",
 		       metrics.tcp_connect_ms,
 		       metrics.tls_handshake_ms,
+		       metrics.raw_handshake_ms,
 		       metrics.mqtt_connect_ms,
 		       metrics.full_connect_ms,
 		       metrics.error_code,
@@ -864,13 +947,17 @@ int main(void)
 		       metrics.client_heap_peak_bytes);
 
 		if (IS_ENABLED(CONFIG_APP_BENCH_REBOOT_AFTER_ATTEMPT)) {
+			bench_store_next_attempt(i + 1, total_attempts);
 			k_sleep(K_MSEC(1500));
-			sys_reboot(SYS_REBOOT_COLD);
+			if (i < total_attempts) {
+				sys_reboot(SYS_REBOOT_COLD);
+			}
 		}
 
 		k_sleep(K_MSEC(CONFIG_APP_BENCH_PAUSE_MS));
 	}
 
+	bench_store_next_attempt(total_attempts + 1, total_attempts);
 	BENCH_EVENT("BENCH_DONE,total,%d\n", total_attempts);
 	while (1) {
 		k_sleep(K_SECONDS(60));

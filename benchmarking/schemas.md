@@ -47,8 +47,16 @@ Columns:
 - `attempt_index`: 1-based attempt index, including warmups.
 - `warmup`: `1` for warmup attempt, `0` for measured attempt.
 - `status`: `success`, `timeout`, `error`, or `unsupported`.
+- key exchange metadata: `kex_group`, `kex_nist_level`,
+  `kex_public_key_bytes`, `kex_ciphertext_bytes`,
+  `kex_shared_secret_bytes`
+- certificate/signature metadata: `cert_sig_alg`, `sig_nist_level`,
+  `sig_public_key_bytes`, `sig_private_key_bytes`, `sig_signature_bytes`
 - `tcp_connect_ms`: TCP connect time measured by the board.
-- `tls_handshake_ms`: TLS handshake time measured by the board.
+- `tls_handshake_ms`: TLS path time measured by the board, after TCP connect and
+  including local wolfSSL TLS context setup.
+- `raw_handshake_ms`: TLS network handshake time measured by the board, after
+  subtracting local `tls_setup_ms` from `tls_handshake_ms`.
 - `mqtt_connect_ms`: MQTT CONNECT/SUBSCRIBE time measured by the board.
 - `full_connect_ms`: TCP + TLS + MQTT time measured by the board.
 - `error_code`: firmware or host error code when applicable.
@@ -77,6 +85,10 @@ Columns:
 - `mean_handshake_ms`, `median_handshake_ms`, `p95_handshake_ms`
 - `min_handshake_ms`, `max_handshake_ms`, `stddev_handshake_ms`
 - `handshake_throughput_hps`
+- raw TLS network-handshake aggregates: `mean_raw_handshake_ms`,
+  `median_raw_handshake_ms`, `p95_raw_handshake_ms`,
+  `min_raw_handshake_ms`, `max_raw_handshake_ms`,
+  `stddev_raw_handshake_ms`, `raw_handshake_throughput_hps`
 - `mean_full_connect_ms`, `connections_per_second`
 - client resource aggregates: `mean_client_cpu_ms`, `mean_client_cpu_pct`,
   `max_client_wolfssl_peak_bytes`, `max_client_wolfssl_failures`,

@@ -32,7 +32,7 @@ config APP_TLS_HANDSHAKE_TIMEOUT_MS
 
 config APP_TLS_IO_TIMEOUT_MS
 	int "TLS socket I/O timeout in milliseconds"
-	default 60000
+	default 10000
 
 config APP_MQTT_KEEPALIVE_SEC
 	int "MQTT keepalive in seconds"
@@ -78,6 +78,14 @@ config APP_BENCH_VERBOSE_LOGS
 	  accounting. Keep this disabled for benchmark runs to avoid serial output
 	  affecting timing. Essential BENCH_* CSV lines are still printed.
 
+config APP_BENCH_WOLFSSL_DEBUG
+	bool "Print wolfSSL diagnostic logs"
+	default n
+	depends on APP_BENCH_VERBOSE_LOGS
+	help
+	  Compile wolfSSL error/debug logging for one-off diagnosis. Keep this
+	  disabled during timing benchmarks because serial output changes results.
+
 choice APP_BENCH_TLS_GROUP
 	prompt "TLS 1.3 key exchange group"
 	default APP_BENCH_TLS_GROUP_MLKEM512
@@ -91,6 +99,15 @@ config APP_BENCH_TLS_GROUP_MLKEM768
 config APP_BENCH_TLS_GROUP_MLKEM1024
 	bool "MLKEM1024"
 
+config APP_BENCH_TLS_GROUP_SECP256R1_MLKEM768
+	bool "SecP256r1MLKEM768"
+
+config APP_BENCH_TLS_GROUP_X25519_MLKEM768
+	bool "X25519MLKEM768"
+
+config APP_BENCH_TLS_GROUP_SECP384R1_MLKEM1024
+	bool "SecP384r1MLKEM1024"
+
 config APP_BENCH_TLS_GROUP_ECDHE_P256
 	bool "ECDHE P-256"
 
@@ -99,6 +116,27 @@ config APP_BENCH_TLS_GROUP_ECDHE_P384
 
 config APP_BENCH_TLS_GROUP_ECDHE_P521
 	bool "ECDHE P-521"
+
+endchoice
+
+choice APP_BENCH_MLKEM_BACKEND
+	prompt "ML-KEM implementation backend"
+	default APP_BENCH_MLKEM_BACKEND_WOLFSSL
+	help
+	  Select which implementation performs ML-KEM key generation,
+	  encapsulation and decapsulation for wolfSSL TLS 1.3 ML-KEM groups.
+	  This affects MLKEM512/768/1024 and hybrid groups that include ML-KEM.
+
+config APP_BENCH_MLKEM_BACKEND_WOLFSSL
+	bool "wolfSSL built-in ML-KEM"
+
+config APP_BENCH_MLKEM_BACKEND_PQM4_CLEAN
+	bool "pqm4/PQClean clean ML-KEM via wolfSSL CryptoCb"
+	depends on APP_BENCH_TLS_GROUP_MLKEM512 || APP_BENCH_TLS_GROUP_MLKEM768 || APP_BENCH_TLS_GROUP_MLKEM1024 || APP_BENCH_TLS_GROUP_SECP256R1_MLKEM768 || APP_BENCH_TLS_GROUP_X25519_MLKEM768 || APP_BENCH_TLS_GROUP_SECP384R1_MLKEM1024
+	help
+	  Route wolfSSL ML-KEM operations through pqm4's vendored PQClean
+	  clean implementations. TLS, X.509 verification and MQTT remain
+	  handled by wolfSSL/wolfMQTT.
 
 endchoice
 

@@ -14,17 +14,32 @@ post-quantum TLS groups and certificate algorithms.
 Initial metrics:
 
 - TLS handshake time and derived handshake throughput.
+- Raw TLS network handshake time, excluding local wolfSSL TLS setup.
 - Full TCP + TLS + MQTT connect time.
 - Connections per second.
 - Key size metadata for each key exchange and certificate signature algorithm.
 - Client-side CPU usage and memory peaks collected by the nRF52840 firmware.
 - Success, failure, timeout, and unsupported counts.
 
-ML-KEM is tested as the TLS 1.3 key exchange group. ECDHE P-256/P-384/P-521 are
+ML-KEM is tested as the TLS 1.3 key exchange group. The hybrid groups
+`SecP256r1MLKEM768`, `X25519MLKEM768`, and `SecP384r1MLKEM1024` are available
+as classical-plus-PQC key-exchange variants. ECDHE P-256/P-384/P-521 are
 available as classical key-exchange baselines. ML-DSA, SLH-DSA, ECDSA, and
 RSA-PSS are treated as server certificate/signature variants. Unsupported
 combinations are recorded as `unsupported`; the runner does not silently fall
 back to a different algorithm.
+
+By default, firmware ML-KEM operations use wolfSSL's built-in implementation.
+To benchmark the `pqm4`/PQClean clean ML-KEM implementation on the board, add:
+
+```bash
+--mlkem-backend pqm4-clean
+```
+
+This routes MLKEM512/768/1024 key generation, encapsulation, and decapsulation
+through wolfSSL's CryptoCb hook, including the ML-KEM portion of hybrid groups.
+TLS framing, classical ECDHE/X25519, certificate verification, MQTT, and all
+non-ML-KEM algorithms still use the normal wolfSSL/wolfMQTT path.
 
 ## Layout
 
@@ -53,6 +68,17 @@ python benchmarking/generate_cases.py --seed 123 --iterations 10 --warmup-iterat
 The command prints the output CSV path. Reusing the same seed gives the same
 case order.
 
+To avoid mixing PQC/hybrid key exchange with classical certificate signatures,
+and avoid mixing classical ECDHE with PQC signatures, add:
+
+```bash
+python benchmarking/generate_cases.py \
+  --seed 123 \
+  --iterations 10 \
+  --warmup-iterations 2 \
+  --separate-pqc-classic
+```
+
 ## Build The Benchmark Docker Image
 
 ```bash
@@ -61,6 +87,28 @@ docker compose -f benchmarking/docker-compose.benchmark.yml run --rm ipsp-benchm
 ```
 
 The OQS check must list `MLKEM512`, `MLKEM768`, and `MLKEM1024`.
+
+## Optional pqm4 Firmware Backend
+
+The `pqm4-clean` firmware backend expects `pqm4` to be present under the local,
+Git-ignored `modules/` directory:
+
+```bash
+git clone --recursive https://github.com/mupq/pqm4.git modules/pqm4
+```
+
+Then run any ML-KEM case with:
+
+```bash
+python benchmarking/run_benchmarks.py \
+  --cases benchmarking/cases/<generated>_benchmark_cases.csv \
+  --seed 123 \
+  --only-case mlkem512__ml_dsa_44 \
+  --mlkem-backend pqm4-clean
+```
+
+If `--mlkem-backend pqm4-clean` is omitted, the firmware keeps using wolfSSL's
+built-in ML-KEM implementation.
 
 ## Dry Run
 
@@ -142,6 +190,9 @@ python benchmarking/run_benchmarks.py \
 
 Useful hardware-run options:
 
+- `--mlkem-backend wolfssl|pqm4-clean`: choose the firmware implementation for
+  MLKEM512/768/1024 and for the ML-KEM part of hybrid groups. ECDHE cases
+  ignore this option.
 - `--skip-flash`: do not program the board again; the runner only resets it.
   This requires cached cert artifacts for the same `case_id`, created by a
   previous run without `--skip-flash`.
