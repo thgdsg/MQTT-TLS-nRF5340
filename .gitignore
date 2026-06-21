@@ -10,6 +10,8 @@ scripts/pong_tcpdump.log
 host/broker.sslkeylog
 sslkeylog.log
 scripts/sslkeylog.log
+graphic/out
+graphic/__pycache__
 
 *.elf
 *.hex

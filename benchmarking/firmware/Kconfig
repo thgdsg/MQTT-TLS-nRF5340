@@ -86,6 +86,41 @@ config APP_BENCH_WOLFSSL_DEBUG
 	  Compile wolfSSL error/debug logging for one-off diagnosis. Keep this
 	  disabled during timing benchmarks because serial output changes results.
 
+config APP_BLE_IPSP_FAST_LINK
+	bool "Request faster BLE link parameters for IPSP"
+	default n
+	help
+	  Request short BLE connection intervals, maximum data length and 2M PHY
+	  when the host connects. This reduces the transport cost paid by large TLS
+	  handshake flights over IPSP.
+
+config APP_BLE_IPSP_WRITE_CHUNK
+	int "Maximum socket write chunk for IPSP TLS records"
+	default 256
+	range 64 1220
+	help
+	  Upper bound for each non-blocking socket send. Larger chunks reduce
+	  application-level sleeps, while the BLE/6LoWPAN stack still fragments as
+	  needed.
+
+config APP_BLE_IPSP_WRITE_PAUSE_MS
+	int "Pause after transient IPSP write backpressure"
+	default 1
+	range 0 100
+
+config APP_BLE_IPSP_READ_PAUSE_MS
+	int "Pause after empty non-blocking IPSP read"
+	default 1
+	range 0 100
+
+config APP_BLE_IPSP_FAST_LINK_DELAY_MS
+	int "Delay before requesting faster BLE link parameters"
+	default 1500
+	range 0 10000
+	help
+	  Delay the optional PHY/data-length/connection-interval update so it does
+	  not race the host-side IPSP L2CAP setup immediately after connecting.
+
 choice APP_BENCH_TLS_GROUP
 	prompt "TLS 1.3 key exchange group"
 	default APP_BENCH_TLS_GROUP_UNIVERSAL

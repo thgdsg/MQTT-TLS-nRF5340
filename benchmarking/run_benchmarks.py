@@ -555,6 +555,11 @@ def firmware_profile_key(
             f"io_{int(args.tls_io_timeout_sec * 1000)}",
             f"retry_{args.connect_retries}",
             f"delay_{int(args.connect_retry_delay_sec * 1000)}",
+            f"blefast_{1 if args.ble_ipsp_fast_link else 0}",
+            f"bledelay_{args.ble_ipsp_fast_link_delay_ms}",
+            f"wrchunk_{args.ble_ipsp_write_chunk}",
+            f"wrpause_{args.ble_ipsp_write_pause_ms}",
+            f"rdpause_{args.ble_ipsp_read_pause_ms}",
             reboot_part,
             verbose_part,
         ]
@@ -960,6 +965,12 @@ def build_firmware(
         f"CONFIG_APP_BENCH_VERBOSE_LOGS={'y' if args.firmware_verbose_logs else 'n'}",
         f"CONFIG_APP_BENCH_WOLFSSL_DEBUG={'y' if args.firmware_verbose_logs else 'n'}",
     ]
+    ble_fast_link_config = []
+    if args.ble_ipsp_fast_link:
+        ble_fast_link_config = [
+            "CONFIG_BT_USER_PHY_UPDATE=y",
+            "CONFIG_BT_USER_DATA_LEN_UPDATE=y",
+        ]
 
     overlay.parent.mkdir(parents=True, exist_ok=True)
     overlay.write_text(
@@ -975,8 +986,14 @@ def build_firmware(
                 f"CONFIG_APP_BENCH_CONNECT_RETRIES={args.connect_retries}",
                 f"CONFIG_APP_BENCH_CONNECT_RETRY_DELAY_MS={int(args.connect_retry_delay_sec * 1000)}",
                 f"CONFIG_APP_BENCH_REBOOT_AFTER_ATTEMPT={'y' if args.firmware_reboot_after_attempt else 'n'}",
+                f"CONFIG_APP_BLE_IPSP_FAST_LINK={'y' if args.ble_ipsp_fast_link else 'n'}",
+                f"CONFIG_APP_BLE_IPSP_FAST_LINK_DELAY_MS={args.ble_ipsp_fast_link_delay_ms}",
+                f"CONFIG_APP_BLE_IPSP_WRITE_CHUNK={args.ble_ipsp_write_chunk}",
+                f"CONFIG_APP_BLE_IPSP_WRITE_PAUSE_MS={args.ble_ipsp_write_pause_ms}",
+                f"CONFIG_APP_BLE_IPSP_READ_PAUSE_MS={args.ble_ipsp_read_pause_ms}",
                 group_config,
                 mlkem_backend_config,
+                *ble_fast_link_config,
                 *firmware_debug_config,
                 "",
             ]
@@ -1825,6 +1842,16 @@ def parse_args() -> argparse.Namespace:
                         help="per-call firmware TLS socket I/O timeout")
     parser.add_argument("--mqtt-keepalive-sec", type=int, default=120,
                         help="firmware MQTT keepalive; keep high for slow IPSP links")
+    parser.add_argument("--ble-ipsp-fast-link", action=argparse.BooleanOptionalAction, default=False,
+                        help="request short BLE interval, max data length and 2M PHY from the firmware")
+    parser.add_argument("--ble-ipsp-fast-link-delay-ms", type=int, default=1500,
+                        help="delay before firmware requests faster BLE link parameters")
+    parser.add_argument("--ble-ipsp-write-chunk", type=int, default=256,
+                        help="maximum non-blocking socket send size used by firmware over IPSP")
+    parser.add_argument("--ble-ipsp-write-pause-ms", type=int, default=1,
+                        help="firmware pause after transient IPSP write backpressure")
+    parser.add_argument("--ble-ipsp-read-pause-ms", type=int, default=1,
+                        help="firmware pause after an empty non-blocking IPSP read")
     parser.add_argument("--firmware-reboot-after-attempt", action=argparse.BooleanOptionalAction, default=None,
                         help="reboot firmware after each BENCH_ATTEMPT line; defaults to on for pqm4-clean")
     parser.add_argument("--firmware-verbose-logs", action="store_true",

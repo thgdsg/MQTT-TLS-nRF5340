@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <zephyr/bluetooth/conn.h>
 #include <zephyr/kernel.h>
 #include <zephyr/linker/section_tags.h>
 #include <zephyr/net/net_config.h>
@@ -41,8 +42,9 @@
 #define MQTT_TLS_HANDSHAKE_TIMEOUT_MS CONFIG_APP_TLS_HANDSHAKE_TIMEOUT_MS
 #define MQTT_TLS_IO_TIMEOUT_MS CONFIG_APP_TLS_IO_TIMEOUT_MS
 #define MQTT_KEEPALIVE_SEC CONFIG_APP_MQTT_KEEPALIVE_SEC
-#define BLE_IPSP_WRITE_CHUNK 256
-#define BLE_IPSP_WRITE_PAUSE_MS 1
+#define BLE_IPSP_WRITE_CHUNK CONFIG_APP_BLE_IPSP_WRITE_CHUNK
+#define BLE_IPSP_WRITE_PAUSE_MS CONFIG_APP_BLE_IPSP_WRITE_PAUSE_MS
+#define BLE_IPSP_READ_PAUSE_MS CONFIG_APP_BLE_IPSP_READ_PAUSE_MS
 
 #ifndef APP_TLS_GROUP_ID
 #define APP_TLS_GROUP_ID WOLFSSL_ML_KEM_512
@@ -106,6 +108,80 @@ static struct socket_context sock_ctx = {
 };
 static int last_tcp_connect_ms;
 static int last_tls_setup_ms;
+static struct bt_conn *active_bt_conn;
+
+static void fast_link_work_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(fast_link_work, fast_link_work_handler);
+
+static void sleep_or_yield_ms(int ms)
+{
+	if (ms > 0) {
+		k_sleep(K_MSEC(ms));
+	} else {
+		k_yield();
+	}
+}
+
+static void request_fast_link_params(struct bt_conn *conn)
+{
+	/*
+	 * Keep this best-effort: some BlueZ/controller combinations reject one
+	 * of these procedures, but accepting any of them helps TLS records move
+	 * faster over IPSP.
+	 */
+	(void)bt_conn_le_param_update(conn, BT_LE_CONN_PARAM(6, 12, 0, 400));
+
+#if defined(CONFIG_BT_USER_DATA_LEN_UPDATE)
+	(void)bt_conn_le_data_len_update(conn, BT_LE_DATA_LEN_PARAM_MAX);
+#endif
+
+#if defined(CONFIG_BT_USER_PHY_UPDATE)
+	(void)bt_conn_le_phy_update(conn, BT_CONN_LE_PHY_PARAM_2M);
+#endif
+}
+
+static void fast_link_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (active_bt_conn && IS_ENABLED(CONFIG_APP_BLE_IPSP_FAST_LINK)) {
+		request_fast_link_params(active_bt_conn);
+	}
+}
+
+static void connected(struct bt_conn *conn, uint8_t err)
+{
+	if (err != 0) {
+		return;
+	}
+
+	if (active_bt_conn) {
+		bt_conn_unref(active_bt_conn);
+	}
+
+	active_bt_conn = bt_conn_ref(conn);
+
+	if (IS_ENABLED(CONFIG_APP_BLE_IPSP_FAST_LINK)) {
+		(void)k_work_reschedule(&fast_link_work,
+					K_MSEC(CONFIG_APP_BLE_IPSP_FAST_LINK_DELAY_MS));
+	}
+}
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+	ARG_UNUSED(reason);
+
+	if (active_bt_conn == conn) {
+		(void)k_work_cancel_delayable(&fast_link_work);
+		bt_conn_unref(active_bt_conn);
+		active_bt_conn = NULL;
+	}
+}
+
+BT_CONN_CB_DEFINE(bench_conn_callbacks) = {
+	.connected = connected,
+	.disconnected = disconnected,
+};
 
 struct wolfssl_alloc_header {
 	size_t size;
@@ -444,7 +520,7 @@ static int net_read(void *context, byte *buf, int buf_len, int timeout_ms)
 
 		if (rc < 0) {
 			if (socket_errno_is_timeout(errno) || errno == EINPROGRESS) {
-				k_sleep(K_MSEC(10));
+				sleep_or_yield_ms(BLE_IPSP_READ_PAUSE_MS);
 				continue;
 			}
 			BENCH_DEBUG("recv failed: errno=%d\n", errno);
@@ -483,7 +559,7 @@ static int net_write(void *context, const byte *buf, int buf_len, int timeout_ms
 
 			if (socket_errno_is_transient_write(err)) {
 				if (k_uptime_get() < deadline) {
-					k_sleep(K_MSEC(BLE_IPSP_WRITE_PAUSE_MS));
+					sleep_or_yield_ms(BLE_IPSP_WRITE_PAUSE_MS);
 					continue;
 				}
 				BENCH_DEBUG("net_write timeout: errno=%d total=%d requested=%d\n",
@@ -502,7 +578,7 @@ static int net_write(void *context, const byte *buf, int buf_len, int timeout_ms
 
 		total += rc;
 		if (total < buf_len) {
-			k_sleep(K_MSEC(BLE_IPSP_WRITE_PAUSE_MS));
+			sleep_or_yield_ms(BLE_IPSP_WRITE_PAUSE_MS);
 		}
 	}
 
