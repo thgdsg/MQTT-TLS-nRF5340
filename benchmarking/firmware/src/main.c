@@ -1002,7 +1002,7 @@ int main(void)
 
 	start_attempt = bench_start_attempt(total_attempts);
 	if (start_attempt > 1) {
-		BENCH_EVENT("BENCH_RESUME,next_attempt,%d,total,%d\n",
+		BENCH_DEBUG("BENCH_RESUME,next_attempt,%d,total,%d\n",
 			    start_attempt, total_attempts);
 	}
 
@@ -1056,7 +1056,7 @@ int main(void)
 	}
 
 	bench_store_next_attempt(total_attempts + 1, total_attempts);
-	BENCH_EVENT("BENCH_DONE,total,%d\n", total_attempts);
+	BENCH_DEBUG("BENCH_DONE,total,%d\n", total_attempts);
 	while (1) {
 		k_sleep(K_SECONDS(60));
 	}
